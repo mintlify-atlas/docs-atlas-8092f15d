@@ -1,20 +1,87 @@
 ---
-title: "Introduction"
-description: "Welcome to your project"
+title: "Text-to-SQL Agent: Ask Your Database in Plain English"
+sidebarTitle: "Home"
+description: "A self-correcting LangGraph agent that turns natural-language questions into validated, read-only SQL — local Ollama LLM, ChromaDB schema retrieval, FastAPI + React dashboard."
 ---
 
-Write a short description of your product here. What it does, who it's for, and what they can accomplish with it.
+Ask your database a question in plain English and get back validated, read-only SQL you review before it ever runs. The Text-to-SQL Agent is a self-correcting LangGraph state machine that retrieves schema context, generates SQL with a local Ollama model, validates it with an AST-based allowlist, and auto-corrects on failure — all without sending data to any cloud API.
 
-<Tip>
-  Ready to make this your own? Start by editing this page. Update your `docs.json` file to customize your site. Then fill out the [Quickstart](/quickstart) page.
-</Tip>
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install, configure, and run your first query in minutes
+  </Card>
+  <Card title="Docker Setup" icon="docker" href="/quickstart-docker">
+    Build and run with Docker Compose in a single container
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Understand the 11-node LangGraph state machine and retry logic
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/overview">
+    Explore every REST endpoint with request/response shapes
+  </Card>
+</CardGroup>
 
-<Card title="Quickstart" icon="rocket" href="/quickstart">
-  This card links to the quickstart page in your project.
-</Card>
-<Card title="Components" icon="puzzle-piece" href="https://mintlify.com/docs/components">
-  Add cards, callouts, steps, tabs, and more to design and structure your pages.
-</Card>
-<Card title="Settings" icon="gear" href="https://mintlify.com/docs/organize/settings">
-  Set your site name, branding, and navigation in the `docs.json` file.
-</Card>
+## Why Text-to-SQL Agent?
+
+<CardGroup cols={2}>
+  <Card title="SQL is Never Trusted Implicitly" icon="shield-check">
+    Every generated query — including retries and hand-edits — passes through a `sqlglot` AST allowlist that enforces `SELECT`-only statements. No keyword blocklist. No silent trust.
+  </Card>
+  <Card title="Fully Local LLM Stack" icon="server">
+    Ollama runs on your machine. No data leaves it for SQL generation. Cloud APIs are entirely opt-in (web search, media generation).
+  </Card>
+  <Card title="Schema-Aware Retrieval" icon="database">
+    Table DDL is embedded in ChromaDB. Only the top-k relevant tables are retrieved per question, with FK-adjacency expansion pulling in structurally required tables.
+  </Card>
+  <Card title="Self-Correcting Loop" icon="rotate">
+    Validation or execution failures route back to SQL regeneration with the full error trail injected as context — bounded by a configurable retry budget, not an open-ended loop.
+  </Card>
+</CardGroup>
+
+## Get started in three steps
+
+<Steps>
+  <Step title="Install and configure">
+    Clone the repo, create a virtual environment, install dependencies, and copy `.env.example` to `.env` with your database credentials.
+
+    ```bash
+    git clone https://github.com/surajkumarnavodya/text-to-sql-agent-langgraph.git
+    cd text-to-sql-agent-langgraph
+    python -m venv .venv && source .venv/bin/activate
+    pip install -r requirements.txt
+    cp .env.example .env
+    ```
+  </Step>
+  <Step title="Build the schema index">
+    Introspect your database schema and embed it into ChromaDB so the agent can retrieve relevant tables for each question.
+
+    ```bash
+    python scripts/test_db_connection.py
+    python scripts/build_embeddings.py
+    ```
+  </Step>
+  <Step title="Start the server">
+    Build the React dashboard and start the FastAPI server. Both the API and the UI are served from the same process on port 8000.
+
+    ```bash
+    cd frontend && npm install && npm run build && cd ..
+    uvicorn api.main:app --host 0.0.0.0 --port 8000
+    ```
+
+    Open [http://localhost:8000](http://localhost:8000) and ask your first question.
+  </Step>
+</Steps>
+
+## Explore the documentation
+
+<CardGroup cols={3}>
+  <Card title="Concepts" icon="book-open" href="/concepts/architecture">
+    Deep-dives into agent design, schema retrieval, and multi-source routing
+  </Card>
+  <Card title="Guides" icon="map" href="/guides/configuration">
+    Configuration reference, deployment, multi-source setup, and evaluation
+  </Card>
+  <Card title="Security" icon="lock" href="/security/overview">
+    SQL validation, input guards, data governance, and production hardening
+  </Card>
+</CardGroup>

@@ -1,47 +1,190 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Up and Running Locally in Under 10 Minutes"
+sidebarTitle: "Quickstart"
+description: "Clone, configure your database, build the schema index, and send your first natural-language SQL query — LLM, vector index, and database all run locally."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+This guide walks you through setting up the Text-to-SQL Agent on your local machine from scratch. By the end you will have the FastAPI backend and the React dashboard running at `http://localhost:8000`, pointed at your own database, and ready to answer plain-English questions. Every component — the LLM (Ollama), the vector index (ChromaDB), and the database driver — runs locally; no API keys or cloud accounts are required for the core SQL pipeline.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+<Warning>
+  **Use a dedicated read-only database account.** The agent executes queries against your real database. Create a database user with `SELECT`-only privileges and use those credentials in `.env` — never an admin login. See [`SECURITY.md`](https://github.com/surajkumarnavodya/text-to-sql-agent-langgraph/blob/main/SECURITY.md) for the full security posture.
+</Warning>
 
 ## Prerequisites
 
-Before you begin, you must have:
+Before you start, make sure you have the following installed and ready:
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
+- **Python 3.11** — the project's target version (`pyproject.toml` and CI both pin to 3.11).
+- **[Ollama](https://ollama.com)** — installed and running. Pull the default model:
+  ```bash
+  ollama pull llama3.1:8b
+  ```
+- **A real database** — PostgreSQL, MySQL, SQL Server (`mssql`), or Oracle. No sample database is bundled; you need an existing database you can connect to with a read-only account.
+- **Node.js + npm** (a recent LTS release) — required only to build the React dashboard. If you only need the REST API (`POST /ask` and friends), you can skip the frontend build step.
 
-## Get started
+## Setup steps
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  ### Clone the repository
 
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+  ```bash
+  git clone https://github.com/surajkumarnavodya/text-to-sql-agent-langgraph.git
+  cd text-to-sql-agent-langgraph
+  ```
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+  ### Create a virtual environment and install dependencies
 
-    ```bash
-    your-cli start
-    ```
-  </Step>
+  <Tabs>
+    <Tab title="Linux / macOS">
+      ```bash
+      python -m venv .venv
+      source .venv/bin/activate
+      pip install --upgrade pip
+      pip install -r requirements.txt
+      ```
+    </Tab>
+    <Tab title="Windows (PowerShell)">
+      ```powershell
+      python -m venv .venv
+      .venv\Scripts\Activate.ps1
+      pip install --upgrade pip
+      pip install -r requirements.txt
+      ```
+    </Tab>
+  </Tabs>
+
+  ### Copy the example environment file
+
+  <Tabs>
+    <Tab title="Linux / macOS">
+      ```bash
+      cp .env.example .env
+      ```
+    </Tab>
+    <Tab title="Windows (PowerShell)">
+      ```powershell
+      Copy-Item .env.example .env
+      ```
+    </Tab>
+  </Tabs>
+
+  ### Configure your database connection
+
+  Open `.env` in your editor. Set the following variables to match your database. Every variable is documented inline in `.env.example`.
+
+  ```bash
+  # Which driver to use: postgresql | mysql | mssql | oracle
+  DB_TYPE=postgresql
+  DB_HOST=localhost
+  DB_PORT=5432
+  DB_NAME=your_database
+  DB_USER=your_readonly_user
+  DB_PASSWORD=your_password
+
+  # Optional: restrict schema introspection to a single schema namespace.
+  # Leave blank to use the connection's default.
+  DB_SCHEMA=
+
+  # SQL Server only: must match an ODBC driver installed on this machine.
+  # Common values: "ODBC Driver 17 for SQL Server", "ODBC Driver 18 for SQL Server"
+  DB_ODBC_DRIVER=ODBC Driver 17 for SQL Server
+  ```
+
+  The Ollama settings default to the values below — change them only if Ollama is running on a non-default host or you want a different model:
+
+  ```bash
+  OLLAMA_HOST=http://localhost:11434
+  OLLAMA_MODEL=llama3.1:8b
+  OLLAMA_REQUEST_TIMEOUT_SECONDS=300
+  ```
+
+  <Tip>
+    If you want to connect to multiple databases and have the agent auto-route each question, set `DB_CONNECTIONS=name1,name2,...` and add a `DB_<NAME>_*` block per database. See the full [Configuration reference](/guides/configuration) for details.
+  </Tip>
+
+  ### Verify the database connection
+
+  ```bash
+  python scripts/test_db_connection.py
+  ```
+
+  This confirms that the driver can reach your database with the credentials in `.env` before you invest time building the schema index.
+
+  ### Build the schema index
+
+  ```bash
+  python scripts/build_embeddings.py
+  ```
+
+  This introspects your database's live schema, embeds each table's DDL using `sentence-transformers` (`all-MiniLM-L6-v2` by default), and stores the vectors in ChromaDB at `./embeddings/.chroma`. Re-run this command after any real schema change; it skips re-embedding tables whose DDL fingerprint has not changed.
+
+  ### Build the React dashboard and start the server
+
+  ```bash
+  cd frontend && npm install && npm run build && cd ..
+  uvicorn api.main:app --host 0.0.0.0 --port 8000
+  ```
+
+  The same FastAPI process serves both the REST API and the built dashboard static files. Open `http://localhost:8000/` in your browser — you should see the dashboard UI.
+
+  <Note>
+    **API-only mode:** If you don't need the dashboard UI, skip the `npm` steps and just run `uvicorn api.main:app --host 0.0.0.0 --port 8000`. All REST endpoints work without the frontend build.
+  </Note>
+
+  <Tip>
+    **Frontend hot-reload during UI development:** Run the API in one terminal, then in a second terminal run `cd frontend && npm run dev`. Open `http://localhost:5173/` — Vite proxies all API routes to port 8000, so no CORS setup is needed.
+  </Tip>
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Make your first API call
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+With the server running, send a natural-language question to `POST /ask`:
+
+```bash
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{
+        "question": "What were total sales last quarter?",
+        "enable_insight": true
+      }'
+```
+
+The response includes the generated SQL, the result rows, the retry/attempt history, and (if `enable_insight` is `true`) a grounded plain-English summary. See `api/schemas.py::AskResponse` for the full response shape, or the [API Reference](/api/overview) for endpoint documentation.
+
+If you have set `API_AUTH_TOKEN` in `.env`, add the bearer header to every request:
+
+```bash
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $API_AUTH_TOKEN" \
+  -d '{"question": "What were total sales last quarter?"}'
+```
+
+## Run the tests and linters
+
+```bash
+# Unit and integration tests
+pytest
+
+# Linting and type checks
+ruff check . && black --check . && mypy .
+```
+
+PowerShell equivalents are in `tasks.ps1` (`.\\tasks.ps1 test`, `.\\tasks.ps1 lint`). Make targets for bash are in the `Makefile`. CI (`.github/workflows/ci.yml`) runs the same lint and test steps on every push.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Docker Quickstart" icon="docker" href="/quickstart-docker">
+    Run the entire stack in a single Docker container with a persistent Chroma volume.
+  </Card>
+  <Card title="Configuration Reference" icon="sliders" href="/guides/configuration">
+    Every `.env` variable documented — agent limits, rate limiting, optional features, and more.
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    Understand the 11-node LangGraph graph, the retry-routing table, and schema retrieval.
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/overview">
+    Full endpoint documentation, request/response schemas, and auth model.
+  </Card>
+</CardGroup>

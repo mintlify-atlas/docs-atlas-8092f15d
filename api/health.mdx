@@ -1,0 +1,234 @@
+---
+title: "Dependency Health Check: GET /health Endpoint Reference"
+sidebarTitle: "GET /health"
+description: "Reachability probe for every database, ChromaDB schema index, and Ollama — returns 200 when all pass or 503 when any fail, no auth needed."
+---
+
+`GET /health` performs a real, non-cached reachability probe of every external component the agent depends on: each configured database (via `db.connection.test_connection()`), each database's ChromaDB schema-embedding collection (via a `collection.count()` call), and the local Ollama instance (via a cheap `client.list()` call that requires no generation and no model loading). The endpoint is deliberately lightweight — it never executes a SQL query, never generates SQL, and never re-introspects schema.
+
+The HTTP status code is the primary signal for automated tooling: `200 OK` means every component passed, `503 Service Unavailable` means at least one did not. The response body provides per-component detail for human inspection. One unreachable database among several is enough to mark the entire response `"degraded"` — a partial failure is never silently dropped, because a caller relying on that database would have no other way to detect the problem.
+
+<Note>
+**No authentication required.** `GET /health` is the only endpoint that never checks `API_AUTH_TOKEN`, even when that setting is configured. Container orchestrators and load-balancer health probes need to reach this endpoint without an API key. It compensates by never returning data rows, schema content, or any other application data — only component reachability status. Sensitive error detail (e.g. raw driver messages containing connection strings) is redacted before appearing in the `detail` field.
+</Note>
+
+---
+
+## Request
+
+```
+GET /health
+```
+
+No request body. No query parameters. No `Authorization` header required.
+
+### Example
+
+```bash
+curl -s http://localhost:8000/health | jq
+```
+
+---
+
+## Response
+
+`Content-Type: application/json`
+
+<ResponseField name="status" type="'ok' | 'degraded'">
+  `"ok"` when Ollama is reachable **and** every configured database's connection and schema index are both healthy. `"degraded"` if any single check fails. Mirrors the HTTP status code: `200` for `"ok"`, `503` for `"degraded"`.
+</ResponseField>
+
+<ResponseField name="databases" type="array">
+  One entry per database configured in `Settings.databases` (a single entry named `"default"` for a plain single-database setup). The overall `status` is `"degraded"` if any entry's `connection.ok` or `schema_index.ok` is `false`.
+
+  <Expandable title="DatabaseHealth fields">
+    <ResponseField name="name" type="string">
+      The database name from `Settings.databases[i].name` (e.g. `"default"`, `"warehouse"`, `"crm"`).
+    </ResponseField>
+    <ResponseField name="connection" type="object">
+      Reachability result from `db.connection.test_connection()`.
+
+      <Expandable title="ComponentHealth fields">
+        <ResponseField name="ok" type="bool">
+          `true` if the database accepted a test connection; `false` otherwise.
+        </ResponseField>
+        <ResponseField name="detail" type="string">
+          Human-readable message: `"Connection successful."` on success, or a redacted driver error on failure.
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+    <ResponseField name="schema_index" type="object">
+      ChromaDB schema-collection health. `ok` requires `collection.count() > 0` — an empty index means no tables have been embedded yet.
+
+      <Expandable title="ComponentHealth fields">
+        <ResponseField name="ok" type="bool">
+          `true` if the Chroma collection is reachable and contains at least one indexed table. `false` if unreachable or empty.
+        </ResponseField>
+        <ResponseField name="detail" type="string">
+          `"N table(s) indexed."` when healthy; `"Index is empty — run scripts/build_embeddings.py."` when reachable but empty; or a redacted error string when the collection cannot be reached.
+        </ResponseField>
+      </Expandable>
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="ollama" type="object">
+  Reachability result for the local Ollama instance, checked via `client.list()` — a metadata call that requires no model loading or text generation.
+
+  <Expandable title="ComponentHealth fields">
+    <ResponseField name="ok" type="bool">
+      `true` if the Ollama HTTP API responded to the `list()` call; `false` otherwise.
+    </ResponseField>
+    <ResponseField name="detail" type="string">
+      `"Reachable at {Settings.ollama_host}."` on success (e.g. `"Reachable at http://localhost:11434."`), or a redacted error string on failure.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="voice_enabled" type="bool">
+  Reflects `Settings.enable_voice_mode`. `true` means the `/voice/transcribe` and `/voice/synthesize` routes are active; `false` means they return `404`.
+</ResponseField>
+
+<ResponseField name="media_search_enabled" type="bool">
+  Reflects `Settings.enable_media_search`. `true` means the `/search/media` and `/media/library/{media_id}` routes are active; `false` means they return `404`.
+</ResponseField>
+
+---
+
+## Response Examples
+
+<Tabs>
+  <Tab title="200 OK — all healthy">
+    ```json
+    {
+      "status": "ok",
+      "databases": [
+        {
+          "name": "default",
+          "connection": {
+            "ok": true,
+            "detail": "Connection successful."
+          },
+          "schema_index": {
+            "ok": true,
+            "detail": "31 table(s) indexed."
+          }
+        }
+      ],
+      "ollama": {
+        "ok": true,
+        "detail": "Reachable at http://localhost:11434."
+      },
+      "voice_enabled": true,
+      "media_search_enabled": false
+    }
+    ```
+  </Tab>
+  <Tab title="503 — degraded (Ollama down)">
+    ```json
+    {
+      "status": "degraded",
+      "databases": [
+        {
+          "name": "default",
+          "connection": {
+            "ok": true,
+            "detail": "Connection successful."
+          },
+          "schema_index": {
+            "ok": true,
+            "detail": "31 table(s) indexed."
+          }
+        }
+      ],
+      "ollama": {
+        "ok": false,
+        "detail": "Unreachable: Connection refused (http://localhost:11434)."
+      },
+      "voice_enabled": false,
+      "media_search_enabled": false
+    }
+    ```
+  </Tab>
+  <Tab title="503 — degraded (empty schema index)">
+    ```json
+    {
+      "status": "degraded",
+      "databases": [
+        {
+          "name": "default",
+          "connection": {
+            "ok": true,
+            "detail": "Connection successful."
+          },
+          "schema_index": {
+            "ok": false,
+            "detail": "Index is empty -- run scripts/build_embeddings.py."
+          }
+        }
+      ],
+      "ollama": {
+        "ok": true,
+        "detail": "Reachable at http://localhost:11434."
+      },
+      "voice_enabled": false,
+      "media_search_enabled": false
+    }
+    ```
+  </Tab>
+  <Tab title="503 — degraded (DB unreachable)">
+    ```json
+    {
+      "status": "degraded",
+      "databases": [
+        {
+          "name": "default",
+          "connection": {
+            "ok": false,
+            "detail": "Unreachable: (pyodbc.OperationalError) could not connect to server."
+          },
+          "schema_index": {
+            "ok": false,
+            "detail": "Unreachable: ChromaDB collection unavailable."
+          }
+        }
+      ],
+      "ollama": {
+        "ok": true,
+        "detail": "Reachable at http://localhost:11434."
+      },
+      "voice_enabled": false,
+      "media_search_enabled": false
+    }
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## What Each Check Actually Does
+
+<CardGroup cols={3}>
+  <Card title="Database connection" icon="database">
+    Calls `db.connection.test_connection(config)` for each configured database. This opens a real connection from the pool and validates it, without executing any application query.
+  </Card>
+  <Card title="Schema index" icon="magnifying-glass">
+    Calls `collection.count()` on the ChromaDB collection for each database. `ok` requires `count > 0` — the index must be non-empty. An empty index means `scripts/build_embeddings.py` has not been run yet.
+  </Card>
+  <Card title="Ollama" icon="microchip">
+    Calls `client.list()` on the configured Ollama host — a metadata-only call. No model is loaded, no text is generated, and no tokens are consumed.
+  </Card>
+</CardGroup>
+
+---
+
+## HTTP Status Codes
+
+| Status | Meaning |
+|--------|---------|
+| `200 OK` | All components healthy — `status: "ok"` in body |
+| `503 Service Unavailable` | One or more components unreachable or misconfigured — `status: "degraded"` in body |
+
+<Tip>
+Container orchestrators (Docker Compose `healthcheck:`, Kubernetes `livenessProbe`/`readinessProbe`) should check the HTTP status code, not parse the JSON body. A `503` response is structurally identical to a `200` response — the per-component `detail` fields are for human debugging only.
+</Tip>

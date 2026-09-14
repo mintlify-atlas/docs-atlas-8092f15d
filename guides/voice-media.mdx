@@ -1,0 +1,196 @@
+---
+title: "Voice Input, TTS, Media Generation, and Media Search"
+sidebarTitle: "Voice & Media"
+description: "Configure local speech-to-text and text-to-speech for hands-free querying, IMA Studio image and video generation, and CLIP-powered local media library search."
+---
+
+Beyond text queries and SQL databases, the Text-to-SQL Agent supports three optional media-adjacent capabilities: voice mode (local STT and TTS, on by default), media generation (AI image and video creation via IMA Studio, off by default), and media search (CLIP-based semantic search over a local image and video library, off by default). Each feature is independently controlled by a feature flag and can be combined with any other configuration. This page covers what each feature does, how to enable and configure it, and the important caveats worth knowing before turning it on.
+
+<Tabs>
+  <Tab title="Voice Mode">
+    Voice mode gives the React dashboard a microphone button for spoken questions and synthesizes responses as audio. Both speech-to-text and text-to-speech run entirely locally — no cloud API, no external calls, no per-use cost once the one-time model downloads are complete. This is consistent with the project's "fully local" posture alongside Ollama.
+
+    Voice mode ships **enabled by default** (`ENABLE_VOICE_MODE=true`). Unlike media generation, it costs nothing and calls no external API after its initial setup, so it is on from the first run.
+
+    ### How It Works
+
+    **Speech-to-Text (STT):** The mic button records a question and uploads it to `POST /voice/transcribe`. The server transcribes it with `faster-whisper` — a local model running entirely on-device. Before transcription, the agent builds a short vocabulary hint from your actual schema (table and column names), passed to Whisper's `initial_prompt` so domain-specific terms are less likely to be mishearing. The transcribed text is then passed through the exact same `POST /ask` path — and the same `agent/input_guard.check_input` validation — as a typed question. Voice input gets no special trust.
+
+    **Text-to-Speech (TTS):** Responses are synthesized by Piper, a local neural TTS engine. Piper requires a one-time voice model download:
+
+    ```bash
+    python scripts/download_voice_model.py
+    ```
+
+    `POST /voice/synthesize` returns a clean `503` until this has run — not a crash, just a missing one-time setup step. Persist the `voice/models/` directory as a named volume to avoid re-running this after container recreates.
+
+    <Warning>
+    The **live word-by-word caption** feature in the React dashboard uses the **browser's built-in Web Speech API**, not `faster-whisper`. The browser API is only available in Chromium-based browsers, and it is cloud-backed — it sends audio to the browser vendor's servers for transcription. The caption is a display aid only; the actual question sent to the agent always comes from the `faster-whisper` transcription. Users on Firefox or Safari will not see live captions, but voice input still works via the upload path.
+    </Warning>
+
+    ### Configuration
+
+    | Variable | Default | Description |
+    |---|---|---|
+    | `ENABLE_VOICE_MODE` | `true` | Whether the mic button and voice settings appear in the UI. The `GET /health` response includes a `voice_enabled` field the frontend reads. |
+    | `STT_MODEL_SIZE` | `base` | `faster-whisper` model size: `tiny`, `base`, `small`, `medium`, or `large-v3`. Larger models are more accurate but slower and require more RAM. Auto-downloaded from Hugging Face Hub on first use. |
+    | `STT_DEVICE` | `cpu` | `cpu` or `cuda`. Only set `cuda` on a machine with a confirmed CUDA and cuDNN setup — the Docker image does not assume a GPU. |
+    | `STT_VOCABULARY_MAX_CHARS` | `200` | Character cap on the schema vocabulary hint passed to Whisper. Short by design — a hint, not a full schema dump. |
+    | `VOICE_MAX_UPLOAD_MB` | `10` | Maximum upload size for one recorded question. |
+    | `VOICE_MAX_DURATION_SECONDS` | `30` | Maximum recording duration, enforced before transcription begins. |
+    | `TTS_VOICE` | `en_US-lessac-medium` | Piper voice model name. Run `python scripts/download_voice_model.py` after changing this. |
+    | `TTS_VOICE_MODEL_PATH` | *(unset)* | Override for the `.onnx`/`.onnx.json` path if the model is not in the default `voice/models/<TTS_VOICE>.onnx` location. |
+
+    ### API Endpoints
+
+    | Endpoint | Description |
+    |---|---|
+    | `POST /voice/transcribe` | Accepts a recorded audio file (up to `VOICE_MAX_UPLOAD_MB`), returns the transcribed text. |
+    | `POST /voice/synthesize` | Accepts text, returns synthesized audio using the configured Piper voice. Returns `503` until the voice model has been downloaded. |
+
+    ### Model Size Trade-offs
+
+    | Model | RAM | Speed | Accuracy |
+    |---|---|---|---|
+    | `tiny` | ~150 MB | Fastest | Lowest |
+    | `base` | ~300 MB | Fast | Good for most uses |
+    | `small` | ~500 MB | Moderate | Better for accented speech |
+    | `medium` | ~1.5 GB | Slow | High |
+    | `large-v3` | ~3 GB | Slowest | Highest |
+
+    For a local deployment where Ollama is already the primary bottleneck, `base` is the right default — it adds negligible latency compared to SQL generation time.
+  </Tab>
+
+  <Tab title="Media Generation">
+    Media generation enables the agent to create images and videos on demand in response to explicit creation requests. It is powered by IMA Studio's API and is **off by default**.
+
+    <Warning>
+    Media generation is the **only source in this application that spends real, metered money**. IMA Studio charges per generation. By default, `REQUIRE_GENERATION_APPROVAL=true` ensures nothing is charged until a human explicitly confirms. Review your IMA Studio billing before enabling this in any deployment where usage is not tightly controlled.
+    </Warning>
+
+    ### Enabling Media Generation
+
+    Media generation requires the multi-source router:
+
+    ```env
+    ENABLE_MULTI_SOURCE_ROUTER=true
+    ENABLE_MEDIA_GENERATION=true
+    IMA_API_KEY=<your IMA Studio key from https://imastudio.com>
+    ```
+
+    Both `ENABLE_MEDIA_GENERATION=true` and a non-empty `IMA_API_KEY` are required. With just the flag and no key, the router will not offer generation as a destination.
+
+    ### The Approval Flow
+
+    Because generation costs real money, the default flow has an explicit confirmation step:
+
+    1. User asks for something to be created ("generate an image of monthly sales by region").
+    2. The router classifies the request as `generation` and calls `generation_node`.
+    3. The API returns a response with `status: "pending_approval"` — **IMA Studio has not been called yet, nothing has been charged.**
+    4. The user clicks "▶ Generate image" or "▶ Generate video" in the dashboard, or the caller posts to `POST /generate/confirm`.
+    5. IMA Studio is called, the media is generated and cached in-memory.
+    6. Fetch the generated bytes via `GET /media/{media_id}`.
+
+    Set `REQUIRE_GENERATION_APPROVAL=false` only for trusted automation contexts where the extra round-trip is unacceptable and the billing implications have been reviewed.
+
+    ### What Triggers Generation
+
+    The router uses explicit few-shot guidance (`agent/orchestrator/nodes.py::_GENERATION_FEW_SHOT_GUIDANCE`) to distinguish creation requests from ordinary data questions. Trigger phrases include:
+
+    - "generate an image of..."
+    - "create a video showing..."
+    - "make a picture of..."
+
+    The router does **not** trigger generation for questions that merely mention images in passing (e.g. "show me a chart of sales" routes to SQL, not generation).
+
+    ### Media Cache
+
+    Generated media is cached in-process (`media_gen/cache.py`, 100-entry FIFO) rather than written to disk. A container restart loses any in-flight generated media that has not yet been fetched. This is an accepted trade-off for simplicity — if persistence matters, fetch and store the media immediately after generation.
+
+    ### Configuration
+
+    | Variable | Default | Description |
+    |---|---|---|
+    | `IMA_API_KEY` | *(unset)* | IMA Studio API key. `SecretStr`-wrapped. |
+    | `IMA_API_BASE_URL` | `https://api.imastudio.com` | IMA Studio API base URL. |
+    | `REQUIRE_GENERATION_APPROVAL` | `true` | Require explicit `POST /generate/confirm` before calling IMA. |
+    | `MEDIA_GEN_RATE_LIMIT` | `5` | Maximum generation requests per rate window. |
+    | `MEDIA_GEN_RATE_WINDOW_SECONDS` | `60` | Rate limit window in seconds. |
+    | `MEDIA_GEN_VIDEO_DURATION_SECONDS` | *(unset)* | Clip length override for video generation. Seedance 2.0 accepts integers 4–15 only. Leave unset to use the model's default of 5 seconds. |
+    | `SESSION_EXPENSIVE_SOURCE_LIMIT` | `10` | Max combined generation and web-search calls per session per window. |
+    | `SESSION_EXPENSIVE_SOURCE_WINDOW_SECONDS` | `3600` | Window in seconds for the per-session expensive-source ceiling. |
+
+    ### API Endpoints
+
+    | Endpoint | Description |
+    |---|---|
+    | `POST /ask` | Ask a generation question. Returns `status: "pending_approval"` when `REQUIRE_GENERATION_APPROVAL=true`. |
+    | `POST /generate/confirm` | Confirm a pending generation. IMA Studio is called after this. |
+    | `GET /media/{media_id}` | Fetch the generated media bytes. Served from in-memory cache. |
+  </Tab>
+
+  <Tab title="Media Search">
+    Media search indexes a local image and video library and lets the agent answer questions like "find the photo of the site inspection" or "do we have a video of the ribbon-cutting ceremony." All embedding runs locally using CLIP via `sentence-transformers` — no API key and no data sent externally.
+
+    Media search is **off by default** because it pulls in `torch`, `opencv-python`, and `scenedetect` — a meaningfully larger dependency footprint than any other optional feature in this project.
+
+    <Warning>
+    Enabling `ENABLE_MEDIA_SEARCH=true` significantly increases image size and memory usage due to `torch` and `opencv-python`. Measure the impact before deploying. Tesseract OCR is also **not included in the base Docker image** — on-screen text in video frames will not be indexed unless you add it as an image layer (see [Deployment](/guides/deployment)).
+    </Warning>
+
+    ### Enabling Media Search
+
+    ```env
+    ENABLE_MULTI_SOURCE_ROUTER=true
+    ENABLE_MEDIA_SEARCH=true
+    MEDIA_LIBRARY_PATH=/path/to/your/media
+    ```
+
+    Both the flag and a real, existing `MEDIA_LIBRARY_PATH` are required. An enabled flag with no configured folder is treated as unavailable.
+
+    ### Building the Index
+
+    Nothing in the media library is searchable until you run the indexing script:
+
+    ```bash
+    python scripts/build_media_index.py           # process only new/changed files
+    python scripts/build_media_index.py --force    # re-index every file
+    ```
+
+    **Images** are embedded directly with CLIP. **Videos** go through a richer pipeline:
+
+    1. Scene detection with PySceneDetect (`ContentDetector`, sensitivity `MEDIA_SCENE_DETECT_THRESHOLD`) splits each video into segments at natural scene boundaries.
+    2. Each segment is transcribed with faster-whisper (reusing voice mode's loaded model — no second model download).
+    3. Each segment is OCR'd with Tesseract (requires the system binary; a missing binary fails open — the segment is still indexed, just without on-screen text).
+    4. If `MEDIA_VISION_MODEL` names a pulled Ollama vision model (e.g. `llava`), each segment's keyframe is captioned. Blank `MEDIA_VISION_MODEL` skips captioning — segments are still searchable via transcript and OCR text alone.
+
+    The media index reuses the same Chroma `PersistentClient` as the schema index (`chroma_index` volume at `/app/embeddings/.chroma`) — no second volume is needed.
+
+    ### Searching
+
+    Use the dedicated **🖼️ Media Search** page in the dashboard, search from the main chat, or call the API directly:
+
+    ```
+    POST /search/media
+    GET  /media/library/{media_id}
+    ```
+
+    A video hit returns a representative keyframe and a timestamp range, not a streamed clip. The search returns up to `MEDIA_SEARCH_TOP_K` results across images and video segments combined.
+
+    **Disambiguation from generation:** when both media search and media generation are enabled, use explicit verbs. Use "find," "show me," or "do we have" for search; use "create," "generate," or "make" for generation. The router uses explicit guidance (`agent/orchestrator/nodes.py::_MEDIA_SEARCH_VS_GENERATION_GUIDANCE`) to distinguish these, but ambiguous phrasing can cause misrouting.
+
+    ### Configuration
+
+    | Variable | Default | Description |
+    |---|---|---|
+    | `MEDIA_LIBRARY_PATH` | *(unset)* | Root folder for `scripts/build_media_index.py` to walk. |
+    | `MEDIA_EMBEDDING_PROVIDER` | `local_clip` | Only `local_clip` (on-device CLIP) is implemented today. |
+    | `MEDIA_CLIP_MODEL_NAME` | `clip-ViT-B-32` | CLIP checkpoint for embedding images and query text. |
+    | `MEDIA_VISION_MODEL` | *(unset)* | Ollama vision model for video segment captioning. Pull with `ollama pull llava`. Blank skips captioning. |
+    | `MEDIA_MAX_FILE_MB` | `200` | Max file size for `media/ingest.py` to process. |
+    | `MEDIA_SEARCH_TOP_K` | `5` | Max hits returned per query, across images and segments. |
+    | `MEDIA_SCENE_DETECT_THRESHOLD` | `27.0` | PySceneDetect `ContentDetector` sensitivity. Lower = more scene changes detected. `27.0` is PySceneDetect's documented default. |
+    | `MEDIA_INGEST_WORKERS` | `4` | Concurrent worker threads used by `scripts/build_media_index.py`. |
+    | `MEDIA_IMAGE_TILE_THRESHOLD_PX` | `2048` | Images wider or taller than this (in pixels) are tiled before moderation to prevent classifier downsampling from obscuring small regions. |
+  </Tab>
+</Tabs>

@@ -1,0 +1,160 @@
+---
+title: "Text-to-SQL Agent REST API: Service Overview"
+sidebarTitle: "Overview"
+description: "Explore the FastAPI REST service that exposes the LangGraph agent — base URL, all available endpoints, safety guarantees, rate limiting, and correlation ID tracing."
+---
+
+The Text-to-SQL Agent ships a single FastAPI process (`api/main.py`) that is both the REST API and, once the React frontend is built, the server that delivers the dashboard itself. There is no separate backend for programmatic access — calling `POST /ask` from a script and clicking **Ask** in the UI both resolve to the same `run_orchestrated()` call inside the agent graph. That means every safety control documented in the security overview applies identically to the API: the input guard, the AST-based SQL validator, the row cap, the query timeout, the rate limiter, and the sensitive-column blocking layer are shared code, not a parallel implementation that could drift.
+
+## Base URL
+
+```
+http://localhost:8000
+```
+
+The default port is `8000`. To start the server directly:
+
+```bash
+uvicorn api.main:app --host 0.0.0.0 --port 8000
+```
+
+Or via Docker Compose (see the deployment guide):
+
+```bash
+docker compose up api
+```
+
+The server reads the same `.env` the dashboard uses — `config/settings.py` is the single source of truth for database connections, Ollama host, ChromaDB location, and all tunable limits. There is nothing API-specific to configure beyond the optional `API_AUTH_TOKEN` described in the [Authentication guide](/api/authentication).
+
+<Note>
+In production, a full build of the React frontend (`npm run build` inside `frontend/`) is served as static files from this same process via a `StaticFiles` mount. A same-origin deployment requires no CORS configuration. CORS headers are only added when `CORS_ALLOWED_ORIGINS` is explicitly set (for a separate Vite dev server, for example).
+</Note>
+
+## Endpoint Categories
+
+<CardGroup cols={2}>
+  <Card title="Agent Queries" icon="message-question">
+    **POST /ask** — Run a natural-language question through the full agent pipeline and receive SQL, results, and an optional plain-English insight.
+
+    **POST /execute** — Validate and execute a specific SQL string directly; backs the dashboard's "Confirm and Run" button.
+  </Card>
+  <Card title="Schema Management" icon="table">
+    **GET /schema/tables** — Retrieve the live table and column listing for all configured databases, the same metadata the schema browser sidebar uses.
+
+    **POST /schema/refresh** — Re-introspect and re-embed every configured database's schema; skips unchanged databases automatically.
+  </Card>
+  <Card title="Feedback & Generation" icon="thumbs-up">
+    **POST /feedback/golden-example** — Save a human-approved (question, SQL) pair for future few-shot retrieval; the same call as the dashboard's thumbs-up widget.
+
+    **POST /generate/confirm** — Human-approval step for media generation; only meaningful when `ENABLE_MULTI_SOURCE_ROUTER` and `ENABLE_MEDIA_GENERATION` are both on.
+  </Card>
+  <Card title="Voice & Media" icon="microphone">
+    **POST /voice/transcribe** — Transcribe a recorded audio question to text using local `faster-whisper`; requires `ENABLE_VOICE_MODE`.
+
+    **POST /voice/synthesize** — Synthesize text to speech via local Piper; returns raw `audio/wav` bytes.
+
+    **POST /search/media** — Direct media-library search; requires `ENABLE_MEDIA_SEARCH`.
+  </Card>
+</CardGroup>
+
+## Endpoint Summary
+
+All endpoints return `application/json` unless noted otherwise. Authentication requirements apply when `API_AUTH_TOKEN` is set — see the [Authentication guide](/api/authentication).
+
+| Method | Path | Auth Required | Response Type | Description |
+|--------|------|:---:|---|---|
+| `GET` | `/health` | Never | JSON | Dependency reachability check (database, Ollama, ChromaDB). Returns `200` or `503`. |
+| `POST` | `/ask` | When set | JSON | Run a natural-language question through the full agent graph. |
+| `POST` | `/execute` | When set | JSON | Validate and execute a specific SQL string read-only. |
+| `GET` | `/schema/tables` | When set | JSON | Live table/column listing for all configured databases. |
+| `POST` | `/schema/refresh` | When set | JSON | Re-introspect and re-embed all configured database schemas. |
+| `POST` | `/feedback/golden-example` | When set | JSON | Save a human-approved (question, SQL) pair for few-shot retrieval. |
+| `POST` | `/generate/confirm` | When set | JSON | Confirm and trigger a proposed media generation. |
+| `POST` | `/voice/transcribe` | No | JSON | Transcribe an audio upload to text (multipart/form-data). |
+| `POST` | `/voice/synthesize` | No | `audio/wav` | Synthesize text to speech; returns raw WAV bytes. |
+| `POST` | `/search/media` | No | JSON | Search the media library by natural-language query. |
+
+<Note>
+`POST /voice/synthesize` is the only endpoint that does **not** return `application/json`. It streams raw `audio/wav` bytes directly. Handle it accordingly in clients that assume a JSON body.
+</Note>
+
+## Safety Guarantees
+
+Because `POST /ask` calls `run_orchestrated()` — the same entry point the React dashboard uses — every safety layer applies without exception:
+
+<Accordion title="Input Guard">
+Every question passes through `agent/input_guard.py` before anything else: a length cap (`Settings.max_question_length`, default 500 chars), Unicode normalization (NFKC plus an explicit homoglyph map), a regex pass for common prompt-injection phrasings, and an off-topic/gibberish filter. A rejected question returns `status: "rejected"` with a `rejection_reason` field — it never reaches the agent graph.
+</Accordion>
+
+<Accordion title="SQL Validator — SELECT-Only AST Allowlist">
+Every generated SQL is parsed with `sqlglot` and checked against a strict AST allowlist in `agent/sql_validator.py`. Only `SELECT`, `UNION`, `EXCEPT`, and `INTERSECT` roots are allowed. Two additional checks close bypass classes: write/DDL operations embedded *anywhere* in the parse tree (including data-modifying CTEs), and a denylist of known-dangerous built-in functions (`pg_sleep`, `pg_read_file`, `xp_cmdshell`, and others). The same validation runs on SQL submitted to `POST /execute` too — SQL from a prior `/ask` response is never trusted implicitly.
+</Accordion>
+
+<Accordion title="Row Cap and Query Timeout">
+`Settings.max_result_rows` (configurable in `.env`) is enforced by `enforce_row_limit()` before execution, adding a `TOP`/`LIMIT` clause. Execution itself runs under `Settings.query_timeout_seconds`. Both apply at `POST /execute` too, independently of what `/ask` already applied at generation time.
+</Accordion>
+
+<Accordion title="Sensitive Column Blocking">
+Columns classified in `config/sensitive_columns.yaml` are never sampled into schema prompts. If generated SQL directly selects a restricted column, the attempt is treated as a retryable correctness error — the model is given feedback to drop the column and try again.
+</Accordion>
+
+## Rate Limiting
+
+Two independent rate limits protect against accidental and deliberate resource exhaustion. Both apply to `POST /ask`:
+
+**Per-client-IP question limiter** — `Settings.question_rate_limit_per_minute` (default 10/minute). Checked in `api/main.py` before `run_orchestrated()` is called, keyed on the request's client IP address.
+
+**Process-wide LLM-call limiter** — `Settings.llm_call_rate_limit_per_minute` (default 20/minute). Checked inside `generate_sql_node` before every generation attempt, including retries within a single question. This is the limit that actually caps how much LLM load any question — including a complex one with multiple retries — can contribute.
+
+Both limits return `HTTP 429` with a `Retry-After` header when tripped:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 42
+Content-Type: application/json
+
+{"detail": "Question rate limit exceeded. Please wait before submitting another question."}
+```
+
+Additional per-IP rate limiting covers action endpoints (`POST /execute`, `POST /schema/refresh`, `POST /generate/confirm`, `POST /search/media`) via `api/rate_limit.py`, sharing the `API_ACTION_RATE_LIMIT_PER_MINUTE` budget.
+
+<Warning>
+These rate limits are in-memory, single-process, and reset on every restart. They are sized for a single local user, not for multi-tenant or distributed deployments. Changing a client IP bypasses the per-IP limit. For anything beyond a trusted local network, place this API behind an authenticating reverse proxy with its own rate-limiting layer.
+</Warning>
+
+## Correlation IDs
+
+Every request is bound to a correlation ID for its entire duration. The middleware in `api/main.py` reads an incoming `X-Correlation-ID` header and uses it; if none is provided, a fresh UUID is generated. The same ID is echoed back in every response's `X-Correlation-ID` header.
+
+```http
+# Supply your own:
+X-Correlation-ID: my-trace-id-001
+
+# Or let the server generate one — always echoed back:
+X-Correlation-ID: f47ac10b-58cc-4372-a567-0e02b2c3d479
+```
+
+Every security audit-log event (`security/audit_log.py`) — input rejections, validator safety violations, rate-limit trips, sensitive-column blocks — includes this ID automatically. You can hand the server a correlation ID on a request and grep the audit log for exactly what happened on that request, with no per-user identity required.
+
+## Interactive Docs
+
+FastAPI automatically generates interactive API documentation at:
+
+- **Swagger UI**: [http://localhost:8000/docs](http://localhost:8000/docs)
+- **ReDoc**: [http://localhost:8000/redoc](http://localhost:8000/redoc)
+
+Both are served from the same process and reflect the actual Pydantic request/response models from `api/schemas.py`.
+
+## What the API Is Not
+
+<Accordion title="Not a stable, versioned public API contract">
+The API is young and evolves alongside the agent. Endpoint signatures, response fields, and status values may change without a major version bump. Pin to a specific commit if stability matters.
+</Accordion>
+
+<Accordion title="Not a multi-tenant API">
+There is no per-user identity, no per-user data isolation, and no authorization model beyond the single shared `API_AUTH_TOKEN`. The rate limiter keys on client IP, not user identity. See the [Authentication guide](/api/authentication) and consult `SECURITY.md` before exposing this beyond a trusted network.
+</Accordion>
+
+<Accordion title="Not a replacement for reading SECURITY.md">
+The security documentation describes every enforced control and every known limitation, including what the SQL validator does *not* prevent, the scope of rate limiting, and the conditions under which prompt-injection defenses apply. Read it before pointing either the UI or the API at a real or sensitive database.
+</Accordion>

@@ -1,0 +1,220 @@
+---
+title: "Enabling Multi-Source Routing Beyond SQL Databases"
+sidebarTitle: "Multi-Source"
+description: "Step-by-step guide to enabling document RAG, policy RAG, live web search, media generation, and media search alongside the core SQL agent."
+---
+
+Out of the box, the agent routes every question directly to the SQL pipeline. The multi-source router extends this with additional answer sources: general-purpose document RAG (uploaded PDFs), a sensitivity-gated policy document store, live web search via Tavily, AI image and video generation via IMA Studio, and content-based search over a local media library. Every source described here is **off by default** — a fresh clone with an unmodified `.env` behaves identically to the SQL-only application. Sources are additive: turn on only what you actually need, in any combination.
+
+<Note>
+**`Settings` is a cached, process-wide singleton.** Changing `.env` requires a full application restart before any source change takes effect. The single most common cause of "I configured it but it's still not routing there" is that the running process still holds its startup `.env` snapshot. Check the terminal log for a `[router] available=[...]` line — if your new source is not listed, restart the app before investigating further.
+</Note>
+
+<Steps>
+  <Step title="Enable the multi-source router">
+    Before any additional source can be reached, the orchestrator graph must be active:
+
+    ```env
+    ENABLE_MULTI_SOURCE_ROUTER=true
+    ```
+
+    With this off, `api/main.py` calls `agent.graph.run_agent` directly and the rest of this guide has no effect. With it on and no other source configured, the router still only ever routes to `sql` — it just makes that routing an inspectable, logged graph step instead of a bare function call. There is zero added latency or extra LLM calls when only SQL is available.
+  </Step>
+
+  <Step title="Configure document and/or policy RAG (optional)">
+    <Accordion title="Document RAG — General PDF Uploads">
+      Document RAG lets the agent answer questions from uploaded PDF files. Set up the RAG store database first (see Step 3 below), then enable:
+
+      ```env
+      ENABLE_DOCUMENT_RAG=true
+      RAG_STORE_CONNECTION_STRING=mssql+pyodbc://<user>:<password>@<host>:1433/RagKnowledgeStore?driver=ODBC+Driver+17+for+SQL+Server
+      ```
+
+      Once both are set and the app is restarted, open the **Knowledge Sources** page (linked from the header nav) and use the **📄 Documents** tab to upload a PDF. You will see a progress bar, then a per-file summary showing chunk count or any errors. A document transitions to `ready` status once fully indexed — it becomes queryable immediately at that point, with no restart needed.
+
+      Ask a question in the main chat. If documents is the only non-SQL source configured, the router reliably distinguishes "is this about the database or the documents." With more sources enabled, questions that span sources may benefit from more specific phrasing.
+    </Accordion>
+
+    <Accordion title="Policy RAG — Sensitivity-Gated HR and Legal Documents">
+      Policy RAG works identically to document RAG from a setup standpoint, but adds a mandatory sensitivity category field at upload time:
+
+      ```env
+      ENABLE_POLICY_RAG=true
+      RAG_STORE_CONNECTION_STRING=<same connection as document RAG>
+      ```
+
+      Upload PDFs via the **🔒 Policies** tab. For each upload, choose a sensitivity category:
+
+      | Category | Use for |
+      |---|---|
+      | `None` | Ordinary policy content: leave policy, dress code, general HR process docs |
+      | `Compensation & pay` | Salary bands, pay grades, bonus structures |
+      | `Disciplinary / HR case content` | Individual case records, PIPs, disciplinary letters |
+      | `Legal / litigation` | Anything subject to legal privilege or litigation hold |
+
+      **What sensitivity gating actually does:** this application has no per-user login or authorization system. Rather than guess who should see what, a chunk from a categorized document is **never summarized into an answer** — the agent detects the category before calling the LLM and returns a fixed message directing the user to HR or the document owner. This is a tested, hard gate in code, not a prompt instruction the model could reason around. Only categorize content that is genuinely restricted — over-categorizing ordinary policy content makes the agent unable to answer normal questions about it.
+    </Accordion>
+  </Step>
+
+  <Step title="Provision the RAG store database">
+    Both document RAG and policy RAG share one dedicated database — two collections, one connection string.
+
+    **Requirements:** SQL Server 2025+ or Azure SQL. The store uses the native `VECTOR` column type in `rag/store.py`. Verify your version first:
+
+    ```sql
+    SELECT @@VERSION;
+    ```
+
+    If you are not on SQL Server 2025+ or Azure SQL, this feature is not available as currently built — that is a real implementation constraint, not a configuration option.
+
+    **Use a dedicated database.** Do not reuse any database listed in `DB_CONNECTIONS`. Chunk and embedding storage is not business data and should not share a schema or connection pool with your operational databases. The schema (`rag.documents`, `rag.chunks`) is created automatically on first use via `rag.store.ensure_schema` — no DDL to run by hand. Create the database if it does not exist:
+
+    ```sql
+    -- Run once in your SQL Server instance:
+    CREATE DATABASE RagKnowledgeStore;
+    ```
+
+    Then set the connection string:
+
+    ```env
+    # Standard host:port SQL Server
+    RAG_STORE_CONNECTION_STRING=mssql+pyodbc://<user>:<password>@<host>:1433/RagKnowledgeStore?driver=ODBC+Driver+17+for+SQL+Server
+
+    # Named instance / LocalDB
+    RAG_STORE_CONNECTION_STRING=mssql+pyodbc:///?odbc_connect=DRIVER%3D%7BODBC+Driver+17+for+SQL+Server%7D%3BSERVER%3D%28localdb%29%5CMSSQLLocalDB%3BDATABASE%3DRagKnowledgeStore%3BUID%3D<user>%3BPWD%3D<password>%3BTrustServerCertificate%3Dyes%3B
+    ```
+
+    Optional tuning knobs (all have sensible defaults):
+
+    | Variable | Default | Description |
+    |---|---|---|
+    | `RAG_TOP_K` | `4` | Chunks retrieved per question, per collection. |
+    | `RAG_MAX_RETRIES` | `2` | Query-rewrite retries before "insufficient information." |
+    | `RAG_CHUNK_SIZE` | `1200` | Target chunk length in characters. |
+    | `RAG_CHUNK_OVERLAP` | `150` | Overlap between consecutive chunks. |
+    | `RAG_EMBEDDING_MODEL_NAME` | *(blank — reuses `EMBEDDING_MODEL_NAME`)* | Override only if documents need a different embedding model than schema retrieval. |
+  </Step>
+
+  <Step title="Enable live web search (optional)">
+    Web search allows the agent to answer questions about current events, general knowledge, or anything outside your database and uploaded documents.
+
+    ```env
+    ENABLE_WEB_SEARCH=true
+    WEB_SEARCH_PROVIDER=tavily
+    WEB_SEARCH_API_KEY=tvly-...
+    ```
+
+    Get a Tavily API key at [tavily.com](https://tavily.com) — a free tier is available. Both `ENABLE_WEB_SEARCH=true` **and** a real non-empty `WEB_SEARCH_API_KEY` are required before the router will ever offer `web` as a destination. Leaving the key blank with the flag on is safe — web search just stays unavailable.
+
+    Web-search answers always open with "According to a live web search:" and list source URLs, so they are never confused with answers drawn from your own data.
+
+    <Note>
+    Web search is the only non-media source that sends question text to an external third-party API. Confirm your network and firewall policy allows outbound HTTPS from the container before relying on this in a restricted environment. See `SECURITY.md` for the full posture discussion.
+    </Note>
+
+    Only `tavily` is implemented today. Swapping to a different provider (Bing, SerpAPI) requires adding it to `search/web_search.py::SUPPORTED_SEARCH_PROVIDERS` — a code change, not a `.env` change.
+  </Step>
+
+  <Step title="Enable media generation (optional)">
+    Media generation allows the agent to create images and videos on demand using IMA Studio's API.
+
+    ```env
+    ENABLE_MULTI_SOURCE_ROUTER=true
+    ENABLE_MEDIA_GENERATION=true
+    IMA_API_KEY=<your IMA Studio key>
+    ```
+
+    Get an API key from the [IMA Studio dashboard](https://imastudio.com). Both the flag and a real key are required before the router offers `generation` as a destination.
+
+    **Trigger phrases:** ask for something to be *created* — "generate an image of monthly spend by category," "create a short video of a factory production line." The router distinguishes explicit creation requests from ordinary data questions, even when a question mentions a picture in passing.
+
+    <Warning>
+    Media generation is the **only source that spends real, metered money**. By default, `REQUIRE_GENERATION_APPROVAL=true` means generation requests return `status="pending_approval"` and nothing is charged until the user clicks "▶ Generate image" or "▶ Generate video" in the dashboard, or calls `POST /generate/confirm` directly. Set `REQUIRE_GENERATION_APPROVAL=false` only in a trusted automation context that has already reviewed this tradeoff. Image generation has been confirmed end-to-end against a live IMA account; video generation shares the same code path but has not been separately confirmed with a live call.
+    </Warning>
+
+    Generated media is served through the application's own `GET /media/{media_id}` route — never the provider's raw URL. The cache is bounded, in-memory, and process-lifetime: a container restart loses any in-flight generated media that has not yet been fetched.
+
+    Key variables:
+
+    | Variable | Default | Description |
+    |---|---|---|
+    | `REQUIRE_GENERATION_APPROVAL` | `true` | Require explicit confirmation before calling IMA Studio. |
+    | `MEDIA_GEN_RATE_LIMIT` | `5` | Max generation requests per `MEDIA_GEN_RATE_WINDOW_SECONDS`. |
+    | `MEDIA_GEN_RATE_WINDOW_SECONDS` | `60` | Rate-limit window in seconds. |
+    | `MEDIA_GEN_VIDEO_DURATION_SECONDS` | *(unset)* | Clip length override. Accepted range for Seedance 2.0: 4–15 seconds. |
+  </Step>
+
+  <Step title="Enable media search (optional)">
+    Media search indexes a local image and video library with CLIP embeddings and lets the agent answer questions like "find the photo of the site inspection" or "do we have a video of the ribbon-cutting ceremony."
+
+    ```env
+    ENABLE_MULTI_SOURCE_ROUTER=true
+    ENABLE_MEDIA_SEARCH=true
+    MEDIA_LIBRARY_PATH=/path/to/your/media
+    ```
+
+    Both the flag and a real, existing folder path are required. Unlike every other source, the default embedding path (`local_clip` via `sentence-transformers`) runs entirely on-device — no API key, no per-item cost, nothing about your media sent to any third party.
+
+    <Warning>
+    Enabling media search pulls in `torch`, `opencv-python`, and `scenedetect` — a meaningfully larger dependency footprint than this project's other optional features. Leave the flag off for deployments that do not need media search. See the Deployment guide for the Docker image-size implications.
+    </Warning>
+
+    **Build the index before querying:**
+
+    ```bash
+    python scripts/build_media_index.py           # skip already-indexed files
+    python scripts/build_media_index.py --force    # re-index every file
+    ```
+
+    How files are processed:
+
+    - **Images:** embedded directly with CLIP.
+    - **Videos:** split into scene-detected segments via PySceneDetect (not fixed intervals), then each segment is transcribed using voice mode's Whisper model, OCR'd (requires the system Tesseract binary — missing binary degrades accuracy but does not fail indexing), and optionally captioned if `MEDIA_VISION_MODEL` names a pulled Ollama vision model such as `llava`.
+
+    Use the dedicated **🖼️ Media Search** page in the dashboard, or search from the main chat. A video hit returns a representative keyframe and a timestamp range. `POST /search/media` exposes the same search outside the conversational flow.
+
+    **Disambiguation note:** when both generation and media search are configured, the router uses explicit guidance to distinguish "make a picture of X" (generation) from "find a picture of X" (media_search). Use "find," "do we have," or "show me" for search and "create," "generate," or "make" for generation when phrasing matters.
+  </Step>
+
+  <Step title="Restart the application after any .env change">
+    Because `Settings` is a `@lru_cache` singleton, every `.env` change — including enabling a new source, changing a connection string, or updating an API key — requires a full process restart:
+
+    ```bash
+    # Docker Compose
+    docker compose restart api
+
+    # Local development
+    # Stop uvicorn and re-run: uvicorn api.main:app --reload (or without --reload)
+    ```
+
+    After restart, confirm the new source appears in the `[router] available=[...]` log line before assuming something is broken.
+  </Step>
+</Steps>
+
+## Multi-Source Questions and Known Limitations
+
+With two or more sources configured, one extra LLM call classifies which source or sources a question needs. This is visible in terminal logs as `[router] available=[...] sources=[...] reasoning=...`. A question that genuinely spans two sources (for example, "compare our leave policy with what's in the HR database") fans out to both in parallel, and the answer shows each source's contribution under its own labeled heading — never blended together.
+
+**Known limitation:** each routed source receives the same full, un-split question text. A question that is really two separate, unrelated asks joined in one sentence can retrieve poorly on both sides, even though each half would work fine asked separately. If a multi-source answer looks wrong or incomplete, try asking the two parts as separate questions before assuming a routing bug.
+
+## Troubleshooting
+
+<Accordion title="I set the env var but the source is still not offered">
+  Restart the app — `Settings` is a cached singleton and the running process holds its startup snapshot. Then check the `[router] available=[...]` log line. If your source is not listed after a restart, verify that all required variables for that source are set (e.g. both `ENABLE_WEB_SEARCH=true` and a non-empty `WEB_SEARCH_API_KEY`).
+</Accordion>
+
+<Accordion title="A question about a known topic routes to the wrong source">
+  Check the `[router] reasoning=...` log field to see what the classifier decided and why. If the response was unparseable, the router falls back to every available source (logged as `classification unparseable (...)`), not to dropping the question.
+</Accordion>
+
+<Accordion title="Upload succeeds but the document is never used in answers">
+  Confirm the document's status is `ready` (not `processing` or `failed`) on the Knowledge Sources page. Then verify you asked a question the document actually answers — check the "Sources: ..." citation line under a document or policy answer to see which file it drew from.
+</Accordion>
+
+<Accordion title="A policy question is always refused">
+  Check whether the retrieved chunks are tagged with a sensitivity category on the Knowledge Sources page. Sensitivity gating is a hard code gate (see Step 2), not a prompt instruction. If the content should not be restricted, delete the document and re-upload it with `None` selected.
+</Accordion>
+
+<Accordion title="VECTOR type errors or RagStoreNotConfiguredError">
+  Verify your SQL Server version supports `VECTOR` and `VECTOR_DISTANCE` with `SELECT @@VERSION`. Confirm the `RAG_STORE_CONNECTION_STRING` points at a reachable database. Note that `scripts/test_db_connection.py` checks `DB_CONNECTIONS` databases, not the RAG store — verify the RAG store connection manually or by attempting an upload and reading the error.
+</Accordion>

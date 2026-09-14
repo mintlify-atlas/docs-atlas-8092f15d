@@ -1,0 +1,175 @@
+---
+title: "Schema Endpoints — Browse and Refresh Database Schema"
+sidebarTitle: "Schema"
+description: "Live table and column metadata for configured databases, plus on-demand schema re-introspection and ChromaDB re-embedding to keep SQL generation current."
+---
+
+Two endpoints manage the schema layer that the Text-to-SQL agent depends on. `GET /schema/tables` exposes a live, metadata-only listing of every table and column in your configured databases — the same introspection the React dashboard's schema browser sidebar uses. `POST /schema/refresh` triggers a full re-introspection and re-embedding cycle: it reads the live database structure, fingerprints each schema, and updates ChromaDB only when the schema has changed since the last run, making it safe to call frequently without unnecessary re-embedding work. Both endpoints reuse the shared `db.schema_introspection.introspect_schema` function — there is no separate schema-read code path for the API.
+
+<Note>
+Neither endpoint queries data rows. `GET /schema/tables` returns column metadata only. `POST /schema/refresh` reads DDL from the database's information schema and writes to ChromaDB — it never touches application data.
+</Note>
+
+---
+
+## GET /schema/tables
+
+Returns a complete table and column listing for all configured databases, or a single database when filtered. This is a live introspection call — it reflects the current state of your database schema, not a cached snapshot.
+
+### Authentication
+
+When `API_AUTH_TOKEN` is set, a matching `Authorization: Bearer <token>` header is required.
+
+### Query Parameters
+
+<ParamField query="database" type="string">
+  Filter results to a single configured database by its name (`Settings.databases[i].name`). Omit to return tables from all configured databases. Supplying an unknown database name returns an empty `tables` array rather than an error.
+</ParamField>
+
+### Response Fields
+
+<ResponseField name="tables" type="TableOut[]" required>
+  List of tables across all requested databases. Each entry includes:
+
+  <Expandable title="TableOut fields">
+    <ResponseField name="database" type="string">
+      The configured database name this table belongs to (`"default"` for a plain single-database setup).
+    </ResponseField>
+    <ResponseField name="table_name" type="string">
+      The table name as it appears in the database's information schema.
+    </ResponseField>
+    <ResponseField name="columns" type="ColumnOut[]">
+      Ordered list of columns. Each `ColumnOut` has:
+      - `name` (string) — column name
+      - `type` (string) — data type as reported by the database dialect (e.g. `"INT"`, `"NVARCHAR(50)"`, `"MONEY"`)
+      - `nullable` (boolean) — whether the column accepts `NULL`
+      - `is_primary_key` (boolean) — whether the column is part of the primary key
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Example Request
+
+```bash
+curl http://localhost:8000/schema/tables \
+  -H "Authorization: Bearer your-token"
+```
+
+### Example Response
+
+```json
+{
+  "tables": [
+    {
+      "database": "default",
+      "table_name": "DimCustomer",
+      "columns": [
+        { "name": "CustomerKey",    "type": "INT",          "nullable": false, "is_primary_key": true  },
+        { "name": "CustomerAlternateKey", "type": "NVARCHAR(15)", "nullable": false, "is_primary_key": false },
+        { "name": "FirstName",      "type": "NVARCHAR(50)", "nullable": true,  "is_primary_key": false },
+        { "name": "LastName",       "type": "NVARCHAR(50)", "nullable": true,  "is_primary_key": false },
+        { "name": "EmailAddress",   "type": "NVARCHAR(50)", "nullable": true,  "is_primary_key": false }
+      ]
+    },
+    {
+      "database": "default",
+      "table_name": "FactInternetSales",
+      "columns": [
+        { "name": "SalesOrderNumber", "type": "NVARCHAR(20)", "nullable": false, "is_primary_key": true  },
+        { "name": "CustomerKey",      "type": "INT",          "nullable": false, "is_primary_key": false },
+        { "name": "SalesAmount",      "type": "MONEY",        "nullable": false, "is_primary_key": false },
+        { "name": "OrderDate",        "type": "DATETIME",     "nullable": false, "is_primary_key": false }
+      ]
+    }
+  ]
+}
+```
+
+### Filter by Database
+
+```bash
+curl "http://localhost:8000/schema/tables?database=sales_db" \
+  -H "Authorization: Bearer your-token"
+```
+
+---
+
+## POST /schema/refresh
+
+Re-introspects every configured database and updates the ChromaDB schema index used for semantic retrieval during SQL generation. Call this after schema changes — new tables, added columns, renamed constraints — to ensure the agent generates SQL against the current schema. The endpoint fingerprints each database's schema before embedding; if the schema is unchanged since the last refresh, ChromaDB is not updated, making repeated calls cheap.
+
+### Authentication
+
+When `API_AUTH_TOKEN` is set, a matching `Authorization: Bearer <token>` header is required.
+
+### Rate Limiting
+
+Rate-limited per client IP using `API_ACTION_RATE_LIMIT_PER_MINUTE`, shared with `/execute` and other action endpoints. Returns `429 Too Many Requests` with a `Retry-After` header when exceeded.
+
+### Request Body
+
+This endpoint takes no request body.
+
+### Response Fields
+
+<ResponseField name="databases" type="SchemaRefreshResult[]" required>
+  One entry per configured database that was re-introspected.
+
+  <Expandable title="SchemaRefreshResult fields">
+    <ResponseField name="database" type="string">
+      The configured database name (`Settings.databases[i].name`).
+    </ResponseField>
+    <ResponseField name="table_count" type="integer">
+      Number of tables found and indexed for this database.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Example Request
+
+```bash
+curl -X POST http://localhost:8000/schema/refresh \
+  -H "Authorization: Bearer your-token"
+```
+
+### Example Response
+
+```json
+{
+  "databases": [
+    { "database": "default",   "table_count": 31 },
+    { "database": "hr_db",     "table_count": 12 }
+  ]
+}
+```
+
+### When to Call /schema/refresh
+
+<CardGroup cols={2}>
+  <Card title="After Schema Migrations" icon="database">
+    Run a refresh immediately after any `ALTER TABLE`, `CREATE TABLE`, or `DROP TABLE` migration so the embedding index reflects the new structure before users submit questions.
+  </Card>
+  <Card title="After Initial Setup" icon="play">
+    The Docker Compose configuration runs `scripts/build_embeddings.py` on first boot, which performs the same embedding work. A manual `/schema/refresh` call is the equivalent for subsequent changes without a restart.
+  </Card>
+  <Card title="On a Schedule" icon="clock">
+    In environments with frequent schema changes, `/schema/refresh` can be called from a cron job or CI pipeline. The fingerprint check means unchanged databases incur no re-embedding cost.
+  </Card>
+  <Card title="Troubleshooting Missing Tables" icon="magnifying-glass">
+    If the agent generates SQL referencing non-existent tables, the embedding index may be stale. A refresh re-reads the live schema and resolves the mismatch.
+  </Card>
+</CardGroup>
+
+## Error Codes
+
+| HTTP Status | Meaning |
+|---|---|
+| `200` | Introspection and index update completed; see `databases` for per-database counts. |
+| `401` | Missing or invalid `Authorization` header (only when `API_AUTH_TOKEN` is set). |
+| `429` | Per-IP action rate limit exceeded; obey the `Retry-After` header. |
+| `503` | One or more databases were unreachable during introspection; check the application logs and `GET /health`. |
+| `500` | Unexpected server error; check application logs. |
+
+<Tip>
+After calling `POST /schema/refresh`, verify the new table counts match your expectations and then run a test question through `POST /ask` against a newly added table. If the agent still cannot find the table, confirm that ChromaDB is reachable via `GET /health` — a degraded `schema_index` entry indicates the embedding write failed.
+</Tip>

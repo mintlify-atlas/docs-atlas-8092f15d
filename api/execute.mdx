@@ -1,0 +1,189 @@
+---
+title: "POST /execute — Validate and Run a Specific SQL Query"
+sidebarTitle: "POST /execute"
+description: "Validate and execute a caller-supplied SQL string read-only against a configured database, returning result rows and an auto-selected Plotly chart."
+---
+
+The `/execute` endpoint backs the dashboard's **Confirm and Run** button: after the agent returns a SQL string from `/ask`, the user reviews it and clicks confirm, which calls `/execute` with that exact SQL. It is also available to programmatic callers who have a SQL string they want to run safely — perhaps hand-edited from a prior `/ask` response — without going through a new natural-language generation pass. Regardless of how the SQL was obtained, every submission is re-validated from scratch: it passes through the full validator pipeline (`validate_sql` → `enforce_row_limit` → `qualify_table_schema` → `execute_readonly_sql`) before a single database call is made. There is no trusted SQL path; submitting a previously generated string does not skip validation.
+
+<Warning>
+Even if you copy `sql` verbatim from an `AskResponse`, the SQL is fully re-validated. This is by design — SQL that was safe when generated can reference stale schema, and hand-editing by a user may introduce unsafe constructs. Any DML (`INSERT`, `UPDATE`, `DELETE`, `DROP`, etc.) is rejected immediately.
+</Warning>
+
+## Endpoint
+
+```
+POST /execute
+```
+
+## Authentication
+
+When `API_AUTH_TOKEN` is set, every request must include a matching `Authorization` header:
+
+```
+Authorization: Bearer <your-token>
+```
+
+Requests missing or mismatching the token receive `401 Unauthorized`.
+
+## Rate Limiting
+
+Rate-limited per client IP using `API_ACTION_RATE_LIMIT_PER_MINUTE` — the same budget shared with `/schema/refresh`, `/voice/transcribe`, and other lightweight action endpoints. Exceeding it returns `429 Too Many Requests` with a `Retry-After` header.
+
+## Request Body
+
+<ParamField body="sql" type="string" required>
+  The SQL string to validate and execute. Whitespace is stripped. Must be at least 1 character. Typically the `sql` field taken verbatim from a prior `AskResponse`, but may be hand-edited. Any statement that is not a `SELECT` (or a `WITH … SELECT`) is rejected immediately with `status: "rejected"`.
+</ParamField>
+
+<ParamField body="database" type="string | null">
+  The name of the configured database to execute against (`Settings.databases[i].name`). Omit — or pass `null` — to target the first configured database, which is the same fallback used by `/ask` when no prior `selected_database` is available. When passing SQL from an `AskResponse`, use that response's `database` field here so execution targets the same database the SQL was generated against.
+</ParamField>
+
+## Response Fields
+
+<ResponseField name="status" type="string" required>
+  Terminal outcome of the validate-and-execute pipeline.
+
+  | Value | Meaning |
+  |---|---|
+  | `succeeded` | SQL passed validation and executed; `result_rows` is populated. |
+  | `rejected` | SQL was refused by the validator (DML, unsafe construct, etc.); `error` explains why. |
+  | `failed` | SQL passed validation but the database returned an error; `error` has the detail. |
+</ResponseField>
+
+<ResponseField name="database" type="string" required>
+  The database name the SQL was executed against (the resolved name, even when the request omitted the `database` field).
+</ResponseField>
+
+<ResponseField name="normalized_sql" type="string | null">
+  The validated, row-limited SQL that was actually sent to the database — after the validator has applied `LIMIT`/`TOP` enforcement and schema qualification. May differ from the submitted `sql` string. `null` when `status` is `"rejected"` or `"failed"` before execution.
+</ResponseField>
+
+<ResponseField name="result_columns" type="string[] | null">
+  Column names of the result set, in order. `null` unless `status` is `"succeeded"`.
+</ResponseField>
+
+<ResponseField name="result_rows" type="any[][] | null">
+  Result rows as a list of lists. Each inner list is one row, values ordered to match `result_columns`. Capped to `MAX_ROWS`. `null` unless `status` is `"succeeded"`.
+</ResponseField>
+
+<ResponseField name="row_count" type="integer | null">
+  Number of rows in `result_rows`. `null` unless `status` is `"succeeded"`.
+</ResponseField>
+
+<ResponseField name="duration_ms" type="float | null">
+  Execution time in milliseconds from submitting the query to receiving all rows. `null` unless `status` is `"succeeded"`.
+</ResponseField>
+
+<ResponseField name="chart" type="object | null">
+  A Plotly figure spec (the output of `Figure.to_plotly_json()`, fully JSON-serialisable) auto-selected from the result shape by `agent/result_charting.py`. `null` when no chart type was deemed suitable for the data (e.g., a single-column result). Render directly with a Plotly client such as `react-plotly.js` — do not re-implement the auto-selection heuristic on the client side.
+</ResponseField>
+
+<ResponseField name="error" type="string | null">
+  Human-readable error description when `status` is `"rejected"` or `"failed"`. `null` on success.
+</ResponseField>
+
+## Validation Pipeline
+
+Every SQL string submitted to `/execute` passes through the same four-stage pipeline in order:
+
+<Steps>
+  <Step title="validate_sql">
+    Parses the SQL and checks it against the SELECT-only allowlist. Rejects DML statements, DDL, stored-procedure calls, and any construct on the blocked-keywords list. Produces a `"rejected"` status immediately on failure.
+  </Step>
+  <Step title="enforce_row_limit">
+    Rewrites the query to add or reduce a `LIMIT` / `TOP` clause so the result set cannot exceed `MAX_ROWS` (default `500`). This rewrite is reflected in `normalized_sql`.
+  </Step>
+  <Step title="qualify_table_schema">
+    Ensures table references include the correct schema prefix for the target database dialect, preventing ambiguous cross-schema hits.
+  </Step>
+  <Step title="execute_readonly_sql">
+    Runs the rewritten query in a read-only database connection with a query timeout (`QUERY_TIMEOUT_SECONDS`). Returns rows or a `"failed"` status with the database error.
+  </Step>
+</Steps>
+
+## Example Request
+
+```bash
+curl -X POST http://localhost:8000/execute \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-token" \
+  -d '{
+    "sql": "SELECT TOP 10 ProductName, ListPrice FROM DimProduct ORDER BY ListPrice DESC",
+    "database": "default"
+  }'
+```
+
+## Example Response
+
+```json
+{
+  "status": "succeeded",
+  "database": "default",
+  "normalized_sql": "SELECT TOP 10 ProductName, ListPrice FROM DimProduct ORDER BY ListPrice DESC",
+  "result_columns": ["ProductName", "ListPrice"],
+  "result_rows": [
+    ["Road-150 Red, 62", 3578.27],
+    ["Road-150 Red, 44", 3578.27],
+    ["Road-150 Red, 48", 3578.27]
+  ],
+  "row_count": 3,
+  "duration_ms": 14.7,
+  "chart": {
+    "data": [
+      {
+        "type": "bar",
+        "x": ["Road-150 Red, 62", "Road-150 Red, 44", "Road-150 Red, 48"],
+        "y": [3578.27, 3578.27, 3578.27],
+        "name": "ListPrice"
+      }
+    ],
+    "layout": {
+      "title": "ProductName vs ListPrice",
+      "xaxis": {"title": "ProductName"},
+      "yaxis": {"title": "ListPrice"}
+    }
+  },
+  "error": null
+}
+```
+
+## Example: Rejected DML
+
+```bash
+curl -X POST http://localhost:8000/execute \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-token" \
+  -d '{
+    "sql": "DELETE FROM DimProduct WHERE ListPrice > 1000"
+  }'
+```
+
+```json
+{
+  "status": "rejected",
+  "database": "default",
+  "normalized_sql": null,
+  "result_columns": null,
+  "result_rows": null,
+  "row_count": null,
+  "duration_ms": null,
+  "chart": null,
+  "error": "Only SELECT statements are permitted. DML and DDL are not allowed."
+}
+```
+
+## Error Codes
+
+| HTTP Status | Meaning |
+|---|---|
+| `200` | Pipeline ran to completion; inspect `status` in the body for the outcome. |
+| `401` | Missing or invalid `Authorization` header (only when `API_AUTH_TOKEN` is set). |
+| `422` | Request body failed schema validation (e.g. empty `sql` field). |
+| `429` | Per-IP action rate limit exceeded; obey the `Retry-After` header. |
+| `500` | Unexpected server error; check application logs. |
+
+<Tip>
+When calling `/execute` after a `/ask` run, always pass the `database` field from the `AskResponse` — especially in multi-database deployments where the agent auto-routes to a specific database. Omitting it targets the first configured database, which may not be the one the SQL was written for.
+</Tip>

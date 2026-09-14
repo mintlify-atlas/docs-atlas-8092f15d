@@ -1,0 +1,136 @@
+---
+title: "Voice Endpoints: Speech-to-Text and Text-to-Speech"
+sidebarTitle: "Voice"
+description: "Transcribe recorded audio questions locally with faster-whisper, then synthesize any answer string back to WAV audio using a local Piper voice model."
+---
+
+The voice endpoints give the React dashboard (and any API client) a purely local speech loop: `POST /voice/transcribe` runs `faster-whisper` in-process to turn an audio recording into the same plain-text string a user could have typed, and `POST /voice/synthesize` feeds that text (or any other string) through a local [Piper](https://github.com/rhasspy/piper) voice model and returns raw WAV bytes. Neither endpoint touches the agent graph directly — transcribed text is returned as-is for the caller to submit through `POST /ask`, so every safety layer (input guard, SQL validator, rate limiting) applies identically to a voice question as it does to a typed one.
+
+Both routes return `404 Not Found` when `ENABLE_VOICE_MODE=false`. Both are rate-limited per client IP using the shared `API_ACTION_RATE_LIMIT_PER_MINUTE` budget. Auth follows the same rule as every other action route: a `Bearer` token is required when `API_AUTH_TOKEN` is set in `.env`.
+
+<Warning>
+**One-time Piper model download required.** `POST /voice/synthesize` returns `503 Service Unavailable` until the configured Piper voice model has been downloaded. Run this once after initial setup — it does not happen automatically:
+
+```bash
+python scripts/download_voice_model.py
+```
+
+`POST /voice/transcribe` (faster-whisper) does not require a separate download step; its model is fetched automatically on first use.
+</Warning>
+
+---
+
+## POST /voice/transcribe
+
+Transcribes a recorded audio question to plain text using the local `faster-whisper` STT model. The returned `text` is untrusted — it is exactly what the STT model produced and has not been validated or sanitised in any way. Submit it to `POST /ask` as you would any typed question; `agent.input_guard.check_input` runs there unconditionally.
+
+<Note>
+The upload is bounded to `Settings.voice_max_upload_mb` (default **10 MB**) at the HTTP layer before transcription begins. The transcribed audio duration is also capped at `Settings.voice_max_duration_seconds` (default **30 s**) — recordings beyond that limit receive `413 Content Too Large` without incurring transcription CPU cost.
+</Note>
+
+### Request
+
+`Content-Type: multipart/form-data`
+
+<ParamField body="audio" type="file" required>
+  The audio recording to transcribe. Any format `faster-whisper` / `ffmpeg` can decode is accepted (MP3, M4A, OGG, WebM, WAV, FLAC, …). Maximum size: `Settings.voice_max_upload_mb` (default 10 MB). Maximum decoded duration: `Settings.voice_max_duration_seconds` (default 30 s).
+</ParamField>
+
+### Response
+
+`Content-Type: application/json`
+
+<ResponseField name="text" type="string">
+  The transcribed question text, exactly as produced by faster-whisper. Plain, untrusted — submit to `POST /ask` next.
+</ResponseField>
+
+<ResponseField name="stt_duration_ms" type="float">
+  Wall-clock time in milliseconds taken by the faster-whisper transcription call, useful for client-side latency logging.
+</ResponseField>
+
+### Example
+
+<Tabs>
+  <Tab title="curl">
+    ```bash
+    curl -s -X POST http://localhost:8000/voice/transcribe \
+      -H "Authorization: Bearer $API_AUTH_TOKEN" \
+      -F "audio=@question.webm" \
+      | jq
+    ```
+  </Tab>
+  <Tab title="Response (200 OK)">
+    ```json
+    {
+      "text": "what were total internet sales last quarter",
+      "stt_duration_ms": 812.4
+    }
+    ```
+  </Tab>
+</Tabs>
+
+### Error Codes
+
+| Status | Condition |
+|--------|-----------|
+| `404 Not Found` | `ENABLE_VOICE_MODE=false` in `.env` |
+| `413 Content Too Large` | Upload exceeds `voice_max_upload_mb`, or decoded audio exceeds `voice_max_duration_seconds` |
+| `429 Too Many Requests` | Per-IP action rate limit exceeded (`API_ACTION_RATE_LIMIT_PER_MINUTE`) |
+| `500 Internal Server Error` | faster-whisper processing error (safe message only — see server logs) |
+
+---
+
+## POST /voice/synthesize
+
+Synthesizes a text string to speech using the local Piper TTS model and returns raw `audio/wav` bytes. The response body is the WAV file itself — there is no JSON wrapper. Text length is capped at `Settings.max_question_length` (the same bound `POST /ask`'s `question` field uses, default 500 characters).
+
+<Warning>
+**Piper model must be downloaded first.** If the configured voice model has not been fetched, this endpoint returns `503 Service Unavailable`. Run `python scripts/download_voice_model.py` once to resolve it.
+</Warning>
+
+### Request
+
+`Content-Type: application/json`
+
+<ParamField body="text" type="string" required>
+  The text to synthesize. Must be non-empty. Capped at `Settings.max_question_length` characters (default 500). Whitespace is stripped automatically.
+</ParamField>
+
+### Response
+
+`Content-Type: audio/wav`
+
+Raw WAV audio bytes. There is no JSON envelope — the entire response body is the audio file. Save it directly to disk or pipe it to an audio player.
+
+### Example
+
+<Tabs>
+  <Tab title="curl">
+    ```bash
+    curl -s -X POST http://localhost:8000/voice/synthesize \
+      -H "Authorization: Bearer $API_AUTH_TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{"text": "Total internet sales last quarter were $1,234,567.89."}' \
+      --output output.wav
+    ```
+  </Tab>
+  <Tab title="Play with aplay (Linux)">
+    ```bash
+    curl -s -X POST http://localhost:8000/voice/synthesize \
+      -H "Authorization: Bearer $API_AUTH_TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{"text": "Total internet sales last quarter were $1,234,567.89."}' \
+      | aplay
+    ```
+  </Tab>
+</Tabs>
+
+### Error Codes
+
+| Status | Condition |
+|--------|-----------|
+| `404 Not Found` | `ENABLE_VOICE_MODE=false` in `.env` |
+| `413 Content Too Large` | `text` exceeds `Settings.max_question_length` |
+| `429 Too Many Requests` | Per-IP action rate limit exceeded (`API_ACTION_RATE_LIMIT_PER_MINUTE`) |
+| `503 Service Unavailable` | Piper voice model not found — run `python scripts/download_voice_model.py` |
+| `500 Internal Server Error` | Piper TTS processing error (safe message only — see server logs) |

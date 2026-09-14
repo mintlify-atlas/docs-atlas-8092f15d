@@ -1,0 +1,144 @@
+---
+title: "POST /feedback — Save a Golden SQL Example"
+sidebarTitle: "POST /feedback"
+description: "Persist a human-approved (question, SQL) pair to ChromaDB for future few-shot retrieval, improving generation accuracy on semantically similar questions."
+---
+
+The `/feedback/golden-example` endpoint closes the human-in-the-loop feedback loop. When a user reviews the agent's SQL result in the dashboard and clicks the thumbs-up widget, this endpoint is called with the confirmed question-and-SQL pair. That pair is embedded and stored in ChromaDB's golden-examples collection. On future questions, the `retrieve_golden_examples_node` performs a semantic similarity search against this collection and injects the closest matches as few-shot examples into the SQL generation prompt — giving the LLM concrete, domain-specific examples of correct queries for your schema. Over time, accumulating golden examples measurably reduces generation errors and retry counts on recurring question patterns.
+
+<Info>
+Golden examples improve generation quality for **similar** future questions. They are retrieved by cosine similarity and only injected when the similarity score meets or exceeds `GOLDEN_EXAMPLES_MIN_SIMILARITY` (default `0.75`). A pair saved today will not affect unrelated queries, but will be surfaced for questions that match its phrasing or intent.
+</Info>
+
+## Endpoint
+
+```
+POST /feedback/golden-example
+```
+
+## Authentication
+
+When `API_AUTH_TOKEN` is set, every request must include a matching `Authorization` header:
+
+```
+Authorization: Bearer <your-token>
+```
+
+Requests missing or mismatching the token receive `401 Unauthorized`.
+
+## How Golden Examples Are Used
+
+<Steps>
+  <Step title="User Confirms a Result">
+    After `/ask` returns `status: "succeeded"`, the user reviews the SQL and result in the dashboard. If correct, they click the thumbs-up icon, triggering a call to this endpoint with the confirmed `question`, `sql`, and `database`.
+  </Step>
+  <Step title="Pair is Embedded and Stored">
+    The server embeds the `question` text using the same embedding model used for schema retrieval, then stores the `(question_embedding, sql, database)` record in ChromaDB's `golden_examples` collection.
+  </Step>
+  <Step title="Retrieved on Similar Future Questions">
+    When a new question arrives at `POST /ask`, `retrieve_golden_examples_node` embeds the question and queries ChromaDB for the top-K closest golden examples. Only pairs with `similarity_score >= GOLDEN_EXAMPLES_MIN_SIMILARITY` are returned.
+  </Step>
+  <Step title="Injected as Few-Shot Prompt Examples">
+    Retrieved pairs are formatted as `-- Example: question → SQL` comments and prepended to the LLM's SQL generation prompt. The model can treat them as reference patterns for the specific tables, joins, and date functions your schema uses.
+  </Step>
+</Steps>
+
+## Request Body
+
+<ParamField body="question" type="string" required>
+  The exact natural-language question text that produced the confirmed SQL. Whitespace is stripped. Must be at least 1 character. Use the original question as submitted to `/ask`, not a paraphrase — the embedding is most useful when it matches how users phrase similar questions.
+</ParamField>
+
+<ParamField body="sql" type="string" required>
+  The exact SQL that was executed and confirmed correct. Must be at least 1 character. Use the `sql` field from the `AskResponse` (or the `normalized_sql` from the subsequent `ExecuteResponse`) — the SQL that was actually run against the database, not a hand-edited variant.
+</ParamField>
+
+<ParamField body="database" type="string" required>
+  The name of the configured database the SQL was generated for (`Settings.databases[i].name`). Use the `database` field from the `AskResponse`. This ensures the golden example is only retrieved for questions routed to the same database, preventing cross-database SQL leakage in multi-database deployments. Must be at least 1 character.
+</ParamField>
+
+## Response Fields
+
+<ResponseField name="saved" type="boolean" required>
+  `true` when the pair was successfully embedded and written to ChromaDB. `false` when the write failed (e.g. ChromaDB unreachable) — the API returns HTTP `200` in both cases; callers should surface a warning to the user when `saved` is `false` so they can retry.
+</ResponseField>
+
+## Example Request
+
+```bash
+curl -X POST http://localhost:8000/feedback/golden-example \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-token" \
+  -d '{
+    "question": "What were total internet sales by product category in 2012?",
+    "sql": "SELECT pc.EnglishProductCategoryName, SUM(fs.SalesAmount) AS TotalSales FROM FactInternetSales fs JOIN DimProduct p ON fs.ProductKey = p.ProductKey JOIN DimProductSubcategory ps ON p.ProductSubcategoryKey = ps.ProductSubcategoryKey JOIN DimProductCategory pc ON ps.ProductCategoryKey = pc.ProductCategoryKey WHERE YEAR(fs.OrderDate) = 2012 GROUP BY pc.EnglishProductCategoryName ORDER BY TotalSales DESC",
+    "database": "default"
+  }'
+```
+
+## Example Response
+
+```json
+{
+  "saved": true
+}
+```
+
+## Example: Failed Save
+
+```json
+{
+  "saved": false
+}
+```
+
+<Warning>
+When `saved` is `false`, the pair was **not** stored. This typically means ChromaDB was unreachable at the time of the request. Verify ChromaDB's health via `GET /health` (`schema_index.ok` in the response) and retry the request. Failed saves are logged with their correlation ID — check the audit log if the problem persists.
+</Warning>
+
+## Tuning Retrieval Sensitivity
+
+The `GOLDEN_EXAMPLES_MIN_SIMILARITY` setting (default `0.75`, range `0.0–1.0`) controls how closely a future question must match a stored example before that example is injected into the prompt.
+
+<Accordion title="Similarity threshold guidelines">
+
+| Threshold | Behaviour |
+|---|---|
+| `0.9+` | Only nearly identical question phrasings retrieve the example. High precision, low recall — good for large golden example collections to avoid irrelevant injections. |
+| `0.75` (default) | Semantically similar questions (same intent, similar vocabulary) retrieve the example. Balanced precision and recall for most deployments. |
+| `0.6–0.74` | Loosely related questions may retrieve the example. Useful when question vocabulary varies widely but the underlying query pattern is reused. |
+| `< 0.6` | Most questions retrieve most examples regardless of relevance. Likely to degrade generation quality by polluting the prompt with unrelated SQL. |
+
+Set `GOLDEN_EXAMPLES_MIN_SIMILARITY` in your `.env` file:
+
+```bash
+GOLDEN_EXAMPLES_MIN_SIMILARITY=0.80
+```
+
+</Accordion>
+
+## Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Confirm Before Saving" icon="check">
+    Only call this endpoint after the SQL result has been verified correct by a human. Saving an incorrect SQL pair will teach the agent to repeat the mistake on similar future questions.
+  </Card>
+  <Card title="Use the Exact SQL" icon="code">
+    Pass the `sql` (or `normalized_sql`) from the API response, not a hand-reformatted version. The agent will reproduce the exact SQL pattern — formatting differences are noise.
+  </Card>
+  <Card title="Cover Edge Cases" icon="star">
+    Golden examples are most valuable for tricky joins, date arithmetic, or dialect-specific functions that the base model handles inconsistently. Prioritise confirming those over straightforward single-table queries.
+  </Card>
+  <Card title="Include the Database" icon="database">
+    Always provide the correct `database` name in multi-database deployments. Without it, the example may be retrieved for questions against the wrong database and produce SQL referencing non-existent tables.
+  </Card>
+</CardGroup>
+
+## Error Codes
+
+| HTTP Status | Meaning |
+|---|---|
+| `200` | Request processed; check `saved` in the body to confirm the pair was stored. |
+| `401` | Missing or invalid `Authorization` header (only when `API_AUTH_TOKEN` is set). |
+| `422` | Request body failed schema validation (e.g. empty `question`, missing `database`). |
+| `500` | Unexpected server error; check application logs. |

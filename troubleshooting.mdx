@@ -1,0 +1,285 @@
+---
+title: "Troubleshooting Common Problems in the Text-to-SQL Agent"
+sidebarTitle: "Troubleshooting"
+description: "Fixes for Ollama connectivity, empty schema index, DB driver issues, rate limits, voice mode setup, React build failures, and Docker networking problems."
+---
+
+Most failures in this agent fall into one of a small set of patterns: a misconfigured environment variable, a one-time setup step that was skipped, or an inherent limitation of local LLM accuracy. The categories below map error messages and observed symptoms to their actual root causes and fixes. Several of these were discovered directly during the project's own production-readiness audit — they are not hypothetical.
+
+<Tip>
+Before investigating any problem, check `GET /health`. It tests Ollama reachability, ChromaDB index status, and database connectivity in one call, and its response body tells you which component is failing — saving you from chasing the wrong thing.
+</Tip>
+
+## Connection Issues
+
+<Accordion title="Ollama not reachable — OllamaUnavailableError or health check fails">
+  **Symptom:** `GET /health` shows `ollama_reachable: false`, or the terminal shows `OllamaUnavailableError`.
+
+  **Causes and fixes:**
+
+  1. Ollama is not running. Start it:
+     ```bash
+     ollama serve
+     ```
+
+  2. `OLLAMA_HOST` in `.env` points somewhere wrong. The default is `http://localhost:11434`. Verify the server is actually listening there:
+     ```bash
+     curl $OLLAMA_HOST/api/tags
+     # Should return a JSON list of pulled models.
+     ```
+
+  3. The model named in `OLLAMA_MODEL` has not been pulled:
+     ```bash
+     ollama pull llama3.1:8b   # or whatever OLLAMA_MODEL is set to
+     ```
+
+  4. In Docker, the container cannot reach a host-side Ollama process. Set `OLLAMA_HOST` to the Docker host's internal address:
+     ```bash
+     # In .env when running inside a container
+     OLLAMA_HOST=http://host.docker.internal:11434
+     ```
+     See the Docker section below for full details.
+</Accordion>
+
+<Accordion title="DB connection failure — configuration, auth, or network">
+  **Symptom:** The app starts but every question fails with a database connection error, or `GET /health` shows `db_connected: false`.
+
+  Every connection failure is classified by `db.connection.ConnectionErrorCategory`. Run the connection test script for the full diagnosis:
+  ```bash
+  python scripts/test_db_connection.py
+  ```
+
+  | Category | Meaning | Fix |
+  |---|---|---|
+  | `configuration` | `.env` is malformed or missing a required `DB_*` field. | Check `DB_TYPE`, `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`. |
+  | `driver_missing` | Python driver for `DB_TYPE` is not installed. | `pip install -r requirements.txt` — all four drivers are listed unconditionally. |
+  | `auth_failure` | Server reachable but credentials rejected. | Check `DB_USER`/`DB_PASSWORD`. If you rotated a password, **restart the server** — `Settings` is a cached singleton and does not re-read `.env` at runtime. |
+  | `host_unreachable` | TCP connection failed entirely. | Check `DB_HOST`, `DB_PORT`, VPN, and firewall rules. |
+  | `database_not_found` | Auth succeeded but the named database doesn't exist. | Check `DB_NAME` for a typo. |
+  | `timeout` | Connection attempt itself timed out. | Check network latency to the host. |
+
+  <Note>
+  Classification is best-effort keyword matching on the underlying driver's own error text. It is not authoritative — the full original error message is always included in the output alongside the category.
+  </Note>
+</Accordion>
+
+<Accordion title="SQL Server (mssql) driver not found or connections fail in Docker">
+  **Symptom:** `DB_TYPE=mssql` connections fail with a `driver_missing` or ODBC-related error even after `pip install -r requirements.txt`.
+
+  `pyodbc` requires the **Microsoft ODBC Driver for SQL Server** installed as a **system package** — it is not pip-installable. This is the one `DB_TYPE` with a manual system-level setup step.
+
+  **On Linux/macOS:**
+  ```bash
+  # Check what ODBC drivers are installed
+  odbcinst -j
+
+  # The output must include "ODBC Driver 17 for SQL Server" or "ODBC Driver 18 for SQL Server"
+  # If not, follow Microsoft's installation guide for your OS.
+  ```
+
+  **In `.env`**, `DB_ODBC_DRIVER` must exactly match the installed driver name:
+  ```bash
+  # Common values:
+  DB_ODBC_DRIVER=ODBC Driver 17 for SQL Server
+  # or
+  DB_ODBC_DRIVER=ODBC Driver 18 for SQL Server
+  ```
+
+  **In Docker**, the base image does not include the ODBC driver layer. You must add it to your `Dockerfile` — see `docs/DEPLOYMENT.md`'s mssql section for the exact image layer to add.
+</Accordion>
+
+<Accordion title="Write-privilege warning from test_db_connection.py">
+  **Symptom:** `python scripts/test_db_connection.py` outputs a warning that `DB_USER` appears to have `INSERT`, `UPDATE`, or `DELETE` grants.
+
+  This is a **warning, not an error** — the app will still run. But the database role being read-only is the real security boundary beneath the SQL validator. Fix this by pointing `DB_USER` at a genuinely read-only role, not by suppressing the warning. The privilege check itself (`db.connection.check_write_privileges`) cannot revoke privileges — it can only tell you they are wider than they should be.
+
+  This warning fired during the project's own reference audit run against the development database. It is a real, easy-to-hit misconfiguration.
+</Accordion>
+
+## Agent and SQL Issues
+
+<Accordion title="Schema index empty — /health shows schema_index.ok: false">
+  **Symptom:** `GET /health` shows `schema_index.ok: false` with the message `"Chroma index is empty -- run scripts/build_embeddings.py"`, or every question fails with `SchemaRetrievalError`.
+
+  The ChromaDB schema index has not been built yet for this database. Run the embedding script:
+  ```bash
+  python scripts/build_embeddings.py
+  ```
+
+  Also run this after any real schema change (new tables, renamed columns, dropped columns). The script is cheap when nothing has changed — it skips re-embedding on a schema fingerprint match.
+
+  You can also trigger a rebuild from the dashboard via the **Refresh Schema** button, or via the API:
+  ```bash
+  curl -X POST http://localhost:8000/schema/refresh \
+    -H "Authorization: Bearer $API_AUTH_TOKEN"
+  ```
+</Accordion>
+
+<Accordion title="Wrong SQL or bad results — agent selects irrelevant tables">
+  **Symptom:** Generated SQL references wrong tables or columns, or results don't match what the question asks. This is particularly common for schema-heavy databases.
+
+  The most direct lever is schema retrieval recall: the agent only sees the top-K most-relevant tables (default `SCHEMA_TOP_K=4`). If a question needs a table that isn't in the top K, the agent can't include it.
+
+  **Fix 1 — Increase `SCHEMA_TOP_K`:**
+  ```bash
+  # In .env
+  SCHEMA_TOP_K=6   # or higher, at the cost of a larger prompt
+  ```
+
+  **Fix 2 — Add table descriptions to `config/table_descriptions.yaml`:**
+  ```yaml
+  # config/table_descriptions.yaml
+  orders: "Contains all customer purchase orders, including date, status, and line items."
+  dim_date: "Date dimension table for filtering by fiscal year, quarter, or month."
+  ```
+  Table descriptions are injected into the schema prompt alongside the DDL and improve retrieval relevance for tables whose column names alone are not self-explanatory.
+
+  **Fix 3 — Rebuild the embedding index** after adding descriptions, so the new context is indexed:
+  ```bash
+  python scripts/build_embeddings.py
+  ```
+
+  For persistent accuracy problems, consider a SQL-specialized model:
+  ```bash
+  # In .env
+  OLLAMA_MODEL=sqlcoder   # or duckdb-nsql
+  ollama pull sqlcoder
+  ```
+  See `docs/EVALUATION.md` for measured accuracy numbers across different model configurations.
+</Accordion>
+
+<Accordion title="Agent gave up after N attempts — retry budget exhausted">
+  **Symptom:** The response contains `"Agent could not produce a working query: Gave up after N attempts"`. The **🔁 Retry timeline** expander shows the full sequence of attempts.
+
+  Check the last attempted SQL and error message shown beneath the failure notice. Common root causes:
+
+  - **Nested aggregate functions** (e.g. `AVG(CASE WHEN ... THEN SUM(x) ELSE 0 END)`): caught by `agent/sql_validator.py` with a targeted rewrite hint. The model should self-correct on the next retry; if it doesn't, rephrase the question to avoid asking for a compound aggregation in one sentence.
+  - **`TOP N ... GROUP BY` instead of a window function** for "top N per group" questions: the model may need `ENABLE_QUERY_PLANNING=true` (the default) and a **🧭 Query plan** expander to have appeared. If it didn't appear, rephrase with explicit "per \<group\>" language.
+  - **Missing join condition**: the model generated a cross join. Check the schema retrieval — if the two tables' relationship is not in the indexed DDL, add a description in `config/table_descriptions.yaml`.
+
+  For any other repeated failure shape, a larger or SQL-specialized model remains the most direct fix.
+</Accordion>
+
+<Accordion title="429 Too Many Requests — rate limit exceeded">
+  **Symptom:** The API returns `429` or the UI shows a rate-limit message.
+
+  Two separate limits can trigger this:
+  - `QUESTION_RATE_LIMIT_PER_MINUTE` (default 10/min, per client IP): exceeded by rapid question submissions.
+  - `LLM_CALL_RATE_LIMIT_PER_MINUTE` (default 20/min, process-wide): exceeded when a question's own retry loop burns through multiple LLM calls in quick succession.
+
+  **Fix:** Increase the relevant limit in `.env` and restart the server. Remember these limits are in-memory — they reset on restart regardless.
+
+  ```bash
+  # In .env
+  QUESTION_RATE_LIMIT_PER_MINUTE=20
+  LLM_CALL_RATE_LIMIT_PER_MINUTE=40
+  ```
+</Accordion>
+
+<Accordion title="Settings not picking up .env changes after an edit">
+  **Symptom:** You changed a value in `.env`, restarted nothing, and the app still uses the old value.
+
+  `Settings` is built once per process via `@lru_cache` in `config/settings.py::get_settings()`. It is an immutable singleton — it does not re-read `.env` while the server is running. **Restart the server process** after any `.env` change.
+
+  ```bash
+  # Stop the running server (Ctrl+C or docker compose down) then restart:
+  uvicorn api.main:app --reload
+  # or
+  docker compose up
+  ```
+
+  This applies to every setting: `OLLAMA_HOST`, `DB_PASSWORD`, `API_AUTH_TOKEN`, rate limits, everything.
+</Accordion>
+
+## UI Issues
+
+<Accordion title="React dashboard not served — browser shows a blank page or 404">
+  **Symptom:** Navigating to `http://localhost:8000` shows nothing, or the FastAPI server returns a 404 for the root path.
+
+  The React frontend must be built before it can be served. The FastAPI app serves the compiled static files from `frontend/dist/` — this directory is not committed and must be built locally:
+
+  ```bash
+  cd frontend
+  npm install
+  npm run build
+  ```
+
+  After the build completes, restart the FastAPI server and the dashboard will be available at `http://localhost:8000`.
+</Accordion>
+
+<Accordion title="Voice mode: POST /voice/synthesize returns 503">
+  **Symptom:** The dashboard shows a voice error when it tries to speak an answer, or `POST /voice/synthesize` returns HTTP 503.
+
+  The Piper text-to-speech voice model has not been downloaded yet. Run the one-time download script:
+
+  ```bash
+  python scripts/download_voice_model.py
+  ```
+
+  This downloads the model named in `TTS_VOICE` (default `en_US-lessac-medium`) into `voice/models/`. It is a one-time step, separate from `pip install`, and does not require an internet connection after the first run.
+
+  If the mic button is missing entirely or `GET /health` shows `voice_enabled: false`, check that `ENABLE_VOICE_MODE=true` in `.env` and restart the server.
+
+  <Note>
+  Live word-by-word captions while speaking use the browser's own `SpeechRecognition` Web Speech API, which is only available in Chromium-based browsers. Firefox and Safari fall back to a manual "Done speaking" button. This does not affect transcription accuracy — the actual submitted text always comes from local `faster-whisper`, not the browser's caption.
+  </Note>
+</Accordion>
+
+## Docker Issues
+
+<Accordion title="Container cannot connect to host-side Ollama">
+  **Symptom:** The app works fine outside Docker but fails with `OllamaUnavailableError` inside a container. `OLLAMA_HOST=http://localhost:11434` does not work from inside a container because `localhost` resolves to the container itself, not the host.
+
+  **Fix:** Use Docker's special hostname for the host machine:
+
+  ```bash
+  # In .env
+  OLLAMA_HOST=http://host.docker.internal:11434
+  ```
+
+  `host.docker.internal` is available on Docker Desktop (macOS and Windows) by default. On Linux with the Docker Engine, you may need to add `--add-host=host.docker.internal:host-gateway` to your `docker run` command, or use the equivalent in `docker-compose.yml`:
+
+  ```yaml
+  # docker-compose.yml addition for Linux
+  services:
+    api:
+      extra_hosts:
+        - "host.docker.internal:host-gateway"
+  ```
+</Accordion>
+
+<Accordion title="docker compose config prints secrets to the terminal">
+  **Symptom:** Running `docker compose config` prints your real `.env` values — including `DB_PASSWORD` and `API_AUTH_TOKEN` — to the terminal.
+
+  This is standard Docker Compose behavior. It resolves and displays the final interpolated configuration, which includes all secrets. Do not run this command in a shared terminal, a CI log, or anywhere the output might be captured or shared. Use it locally to validate syntax only.
+</Accordion>
+
+<Accordion title="mssql connections fail inside a container but work locally">
+  **Symptom:** `DB_TYPE=mssql` connections that work on the host fail inside a Docker container with a driver-related error.
+
+  The project's base Docker image does not include the Microsoft ODBC Driver for SQL Server — it must be added as a layer in your `Dockerfile`. See `docs/DEPLOYMENT.md`'s mssql section for the exact `apt-get` commands and Microsoft package repository setup required.
+
+  Also verify that `DB_ODBC_DRIVER` in `.env` matches exactly the driver name installed inside the container image, not the one installed on your host machine.
+</Accordion>
+
+<Accordion title="docker build or docker compose up fails — cannot connect to Docker daemon">
+  **Symptom:** Any `docker` or `docker compose` command fails immediately with "cannot connect to the Docker daemon."
+
+  Docker Desktop (on macOS or Windows) or the Docker Engine service (on Linux) is not running. Start it before retrying any Docker command.
+</Accordion>
+
+## Diagnosing Unknown Issues
+
+If none of the above covers your problem, structured logging with correlation IDs is the most reliable path to a root cause:
+
+```bash
+# Enable verbose output
+LOG_LEVEL=DEBUG  # in .env, then restart
+
+# Every request gets a correlation_id in its structured log line.
+# Pass X-Correlation-ID: <your-id> in your request header to trace a specific call end-to-end.
+```
+
+The `security.audit` logger captures every rejection, rate-limit trip, and validator safety violation as a structured JSON event with `violation_type`, `input_length`, and other context — search for `"logger": "security.audit"` in your log output to find these events directly.
+
+If you believe a legitimate question was rejected by the input guard, check the terminal for `agent.input_guard` log lines — the actual reason code is logged there even though the user-facing message is deliberately generic (see `SECURITY.md`'s reasoning on rejection messages).

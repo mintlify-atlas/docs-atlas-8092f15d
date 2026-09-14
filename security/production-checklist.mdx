@@ -1,0 +1,185 @@
+---
+title: "Pre-Production Checklist for Text-to-SQL Agent Deployments"
+sidebarTitle: "Production Checklist"
+description: "Go/no-go checklist from the project's production-readiness audit: database roles, TLS proxy, secrets, schema indexing, rate limits, and accuracy caveats."
+---
+
+This checklist is derived directly from the project's own 2026-09-01 production-readiness audit, not a generic template. Work through it **per deployment** — a new database connection, a new environment, or a new set of users each re-open several of these items. Some items below are **blocking** and must be completed before any real data is exposed to the agent. Others are strongly recommended or worth doing before they become problems.
+
+<Warning>
+The documented accuracy baseline for this agent is approximately **35% final accuracy** on the Spider benchmark. That is a starting point, not a target to feel good about matching. Before deploying for any consequential use, explicitly decide what accuracy bar is acceptable for your use case and measure against your real schema — do not assume the benchmark number reflects your data.
+</Warning>
+
+## Blocking — Do Not Deploy Without These
+
+These items represent real safety or data boundaries, not best-practice suggestions. Every one of them was checked against the project's own reference environment during the audit.
+
+<Steps>
+  <Step title="Use a genuinely read-only database account">
+    Set `DB_USER` to a dedicated database role with `SELECT`-only grants. Verify this with `python scripts/test_db_connection.py` — it must report **no** write-privilege warning.
+
+    ```bash
+    python scripts/test_db_connection.py
+    # Expected: "No write privileges detected for DB_USER."
+    # If it warns about INSERT/UPDATE/DELETE grants, fix the DB role — not this setting.
+    ```
+
+    The SQL validator is one layer of defence. A genuinely read-only database role is the real guarantee. A bug in the validator should not be your only line of defence — see `SECURITY.md`.
+  </Step>
+
+  <Step title="Classify sensitive columns before exposing real data">
+    `config/sensitive_columns.yaml` ships empty. Any column containing PII, financial data, or otherwise sensitive values should be classified as `restricted` before the database is connected. A restricted column is never sampled into the schema prompt and any generated SQL that selects one is rejected before execution.
+
+    ```yaml
+    # config/sensitive_columns.yaml — example
+    restricted:
+      - table: customers
+        column: ssn
+      - table: employees
+        column: salary
+    ```
+
+    See `docs/GOVERNANCE.md` for the full classification policy.
+  </Step>
+
+  <Step title="Never commit .env or bake it into a container image">
+    `.env` is gitignored by default but must also not be baked into a Docker image layer or printed by `docker compose config` in any shared or logged context. Use environment variable injection or a secrets manager for production deployments.
+
+    ```bash
+    # Confirm .env is not tracked
+    git status .env         # should show "nothing to commit" or "untracked"
+    git log --oneline -- .env  # should return nothing
+    ```
+  </Step>
+
+  <Step title="Put a TLS-terminating reverse proxy in front of any non-local deployment">
+    Neither the API nor the UI has built-in authentication beyond the optional single shared bearer token (`API_AUTH_TOKEN`). Anything reachable beyond a trusted local network must sit behind a real authenticating reverse proxy — Nginx, Caddy, or a cloud load balancer with mTLS are all suitable.
+
+    ```bash
+    # In .env — API_BIND_HOST defaults to 127.0.0.1 (loopback only)
+    # Do not change this to 0.0.0.0 until a reverse proxy is in place.
+    API_BIND_HOST=127.0.0.1
+    ```
+
+    Port 8000 must never be exposed directly to the internet.
+  </Step>
+
+  <Step title="Set API_AUTH_TOKEN for all /ask and /schema endpoints">
+    Set a strong, randomly-generated bearer token as `API_AUTH_TOKEN` in `.env`. This provides a lightweight shared-secret layer on top of the reverse proxy's own authentication for the `/ask` and `/schema` endpoints.
+
+    ```bash
+    # Generate a token — example using Python
+    python -c "import secrets; print(secrets.token_urlsafe(32))"
+    # Paste the output into .env as:
+    # API_AUTH_TOKEN=<generated_token>
+    ```
+
+    Note: `API_AUTH_TOKEN` is a single shared token, not per-user authentication. It is a hook, not a substitute for the reverse proxy described above.
+  </Step>
+
+  <Step title="Read SECURITY.md in full before proceeding">
+    Specifically read the **"What is explicitly not guaranteed"** and **"Bottom line"** sections. This project explicitly states it has not been through an independent security review. Deploying without understanding those caveats is the most common source of false confidence.
+  </Step>
+</Steps>
+
+## Network and Infrastructure
+
+- [ ] The application is served over TLS — HTTP-only deployments are not acceptable for any data beyond a sandboxed/synthetic dataset.
+- [ ] Port 8000 is not exposed directly; it is accessible only through the reverse proxy.
+- [ ] `API_BIND_HOST` in `.env` is set to `127.0.0.1` (default) when behind a proxy on the same host, or to the internal network interface when the proxy is on a separate host.
+- [ ] Health checks are wired into your deployment platform's monitoring — `GET /health` actually verifies DB, Ollama, and Chroma reachability. Point real alerting at it; do not rely on the container staying in a "running" state.
+
+## Schema Index and Database
+
+- [ ] **Schema index is built and current.** After initial setup and after any schema change, run:
+
+  ```bash
+  python scripts/build_embeddings.py
+  ```
+
+  Verify the index is populated via `GET /health` — `schema_index.ok` must be `true`. An empty index causes every question to fail with a `SchemaRetrievalError`.
+
+- [ ] `DB_SCHEMA` is set to restrict introspection to one schema if the connected database has more than one. Exposing the full database namespace to the LLM increases the chance of the agent selecting irrelevant tables.
+
+  ```bash
+  # In .env
+  DB_SCHEMA=your_app_schema
+  ```
+
+- [ ] The connection test passes cleanly — run `python scripts/test_db_connection.py` and confirm all categories pass with no warnings.
+
+## Secrets Management
+
+- [ ] `.env` is not committed to version control (confirmed with `git log -- .env`).
+- [ ] `.env` is not printed verbatim in any CI log — note that `docker compose config` resolves and prints all interpolated values including secrets; never run it in a shared or logged context.
+- [ ] For production, secrets are injected via environment variables from a secrets manager (AWS Secrets Manager, HashiCorp Vault, Kubernetes Secrets, etc.) rather than a `.env` file.
+- [ ] `DB_PASSWORD` and `DB_CONNECTION_STRING` are wrapped in `SecretStr` in the application (handled automatically by `config/settings.py`) — verify no log lines print `repr(settings)` anywhere in your custom code.
+
+## Rate Limiting
+
+Rate limits are in-memory and single-process. Review the defaults against your expected load before deploying:
+
+| Setting | Default | Notes |
+|---|---|---|
+| `QUESTION_RATE_LIMIT_PER_MINUTE` | 10 | Per client IP. Resets on restart. |
+| `LLM_CALL_RATE_LIMIT_PER_MINUTE` | 20 | Process-wide, includes retries. |
+| `API_ACTION_RATE_LIMIT_PER_MINUTE` | 20 | Per client IP. Covers `/execute`, `/schema/refresh`, `/documents`. |
+
+<Warning>
+These rate limits are in-memory and not distributed. They do not persist across restarts and are not coordinated across multiple replicas. For anything beyond a single-user or single-process deployment, these are insufficient — use a distributed rate limiter backed by Redis or a similar store.
+</Warning>
+
+## Logging and Observability
+
+- [ ] `LOG_REDACTION_LEVEL` is set appropriately for your data sensitivity:
+  - `standard` (default): logs row/column counts and column *names*, never cell values.
+  - `strict`: logs only row/column counts — use this if column names themselves are sensitive (e.g. `ssn`, `salary`).
+
+  ```bash
+  # In .env
+  LOG_REDACTION_LEVEL=strict  # recommended for sensitive schemas
+  ```
+
+- [ ] `LOG_LEVEL=INFO` in production. Use `LOG_LEVEL=DEBUG` only during investigation — debug output is verbose and may include schema context that is sensitive in some environments.
+- [ ] Structured log output from `security/audit_log.py` (the `security.audit` logger) is captured and routed to your SIEM or alerting pipeline if you have one.
+
+## Column Classification
+
+- [ ] `config/sensitive_columns.yaml` has been reviewed and populated for the connected database before any real users interact with the agent.
+- [ ] The file is re-reviewed after any schema change that adds or renames columns.
+- [ ] Columns are classified conservatively — a false positive only costs one retry (the model drops the column and answers with what remains), while a false negative silently exposes the column.
+
+## Media Generation
+
+- [ ] `REQUIRE_GENERATION_APPROVAL=true` (the default) is not changed unless you have a specific trusted-automation use case that requires it. This flag controls whether IMA Studio is called — and therefore whether real money is spent — without explicit human confirmation.
+- [ ] If media generation is not needed for your deployment, set `ENABLE_MEDIA_GENERATION=false` in `.env`. This is the default; verify it has not been changed.
+
+  ```bash
+  # In .env — safe defaults
+  ENABLE_MEDIA_GENERATION=false
+  REQUIRE_GENERATION_APPROVAL=true
+  ```
+
+## Known Limitations Before Production
+
+These items are explicitly out of scope for the current codebase. They are named here so no one discovers them the hard way:
+
+<Accordion title="SQL accuracy: ~35% on Spider benchmark">
+  The documented accuracy baseline is approximately 35% final accuracy on the Spider text-to-SQL benchmark with the default `llama3.1:8b` model and the reference AdventureWorksDW2025 database. This figure reflects the real measured starting point. Accuracy on your specific schema and questions may be higher or lower. Run `python scripts/run_benchmark.py --check-regression` against your own schema before deploying, and explicitly decide what accuracy bar is acceptable for your use case.
+</Accordion>
+
+<Accordion title="Single-user oriented; no distributed sessions">
+  The in-memory rate limiter, the `Settings` singleton, and the process-wide LLM call counter are all designed for one local user. There is no distributed session state, no per-user identity, and no coordination across multiple replicas. Horizontal scaling of the API layer does not help with Ollama throughput (requests are serialized there), and the rate limiters do not coordinate across replicas.
+</Accordion>
+
+<Accordion title="No real multi-user authentication or authorization">
+  `API_AUTH_TOKEN` is a single shared bearer token — not per-user authentication. Anyone with the token has identical access. The Knowledge Sources upload page has no access control of its own either. Put this behind an authenticating reverse proxy before exposing it to more than one person.
+</Accordion>
+
+<Accordion title="No independent security review">
+  This project has been reasoned about carefully and has regression tests for known adversarial input patterns, but it has not been through a third-party pen test or independent threat model. `docs/RISK_REGISTER.md`'s R-005 tracks this as an open item.
+</Accordion>
+
+<Accordion title="No circuit breaker around Ollama or DB failures">
+  Every connection failure is caught and classified (`db/connection.py::ConnectionErrorCategory`), but a sustained Ollama or database outage is not short-circuited at the application layer — every incoming request will attempt and fail until the downstream recovers.
+</Accordion>

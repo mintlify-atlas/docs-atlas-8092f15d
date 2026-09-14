@@ -1,0 +1,176 @@
+---
+title: "Schema Retrieval: ChromaDB, FK-Bridging, and Value Sampling"
+sidebarTitle: "Schema Retrieval"
+description: "How the agent selects the right schema tables per question using ChromaDB cosine similarity, FK-adjacency bridge expansion, and live value sampling."
+---
+
+Dumping an entire production schema into the prompt burns context window and increases the likelihood of hallucinated joins against irrelevant tables. The schema retrieval pipeline solves this by giving the LLM only a small, targeted slice of the schema — but one that is complete enough to answer the question. That second condition is the harder half: a fact table whose columns are all numeric (`SalesAmount`, `OrderQuantity`) scores poorly against a text similarity search even though it may be the only table that structurally connects the concepts in the question. The pipeline addresses this through three layered mechanisms: cosine-similarity top-k retrieval, FK-adjacency bridge expansion, and live value sampling injected into DDL text.
+
+## The full retrieval pipeline
+
+Every question passes through this sequence inside `agent.nodes.retrieve_schema_node`:
+
+```
+introspect_schema()            -- live SQLAlchemy Inspector, metadata only
+        |
+value_sampling.attach_sample_values()  -- real DISTINCT values for
+        |                                  qualifying low-cardinality
+        |                                  string columns (see below)
+        v
+embeddings.schema_indexer.build_index()  -- one Chroma chunk per table,
+        |                                    DDL + sampled values only
+        v
+   [one ChromaDB collection per configured database]
+        |
+        | (per question, in agent.nodes.retrieve_schema_node)
+        v
+embeddings.retriever.select_database()  -- only when 2+ databases are
+        |                                  configured; short-circuits
+        |                                  to the one database otherwise
+        v
+embeddings.retriever.retrieve_relevant_schema()  -- scoped to the
+        |                                            selected database's
+        |                                            own collection
+   1. top-k similarity search
+   2. _expand_with_fk_bridges()  -- FK-adjacency bridge expansion
+        |
+        v
+config.table_descriptions.apply_table_description()  -- fresh from disk,
+        |                                                every question
+        v
+   schema_context_text  -->  plan_query_node (if complex) and generate_sql_node
+```
+
+## ChromaDB collection design
+
+The schema index uses ChromaDB with a local `PersistentClient` — no server process, no separate connection string, always available as part of the core pipeline. Each configured database gets **its own Chroma collection**, named `{CHROMA_COLLECTION_NAME}__{db_name}`. Using a shared collection would risk table-name collisions between two databases that happen to have same-named tables, and would allow FK-bridge expansion to cross physical database boundaries — which is meaningless.
+
+### One chunk per table, not per column
+
+The chunking strategy is deliberate: one chunk per table (the table's synthesized DDL text from `db/schema_introspection.py`), not per column. Retrieval scores whole tables against the question, and `generate_sql_node` concatenates the retrieved chunks directly into the prompt — so a "chunk" is exactly what should be handed to the LLM for one table.
+
+### Cosine distance, explicitly configured
+
+Collections are created with `{"hnsw:space": "cosine"}` rather than accepting ChromaDB's default squared L2. The retriever computes `similarity_score = 1 - distance`, which is only a correct, boundedly-interpretable similarity value under cosine distance. Under the default L2 metric, that expression produces a number that looks like a similarity score but isn't — harmless for relative top-k ordering with unit-normalized embeddings, but wrong for any threshold or margin logic.
+
+### Embedding model
+
+The default embedding model is `all-MiniLM-L6-v2`, served by ChromaDB's bundled ONNX runtime via `DefaultEmbeddingFunction()` — no `sentence-transformers` or `torch` install required. Any `sentence-transformers`-compatible model name can be set via `EMBEDDING_MODEL_NAME`, but changing to a model with a different output dimension requires rebuilding the index.
+
+```python
+# embeddings/schema_indexer.py
+def get_embedding_function(settings: Settings) -> embedding_functions.EmbeddingFunction:
+    if settings.embedding_model_name == "all-MiniLM-L6-v2":
+        return embedding_functions.DefaultEmbeddingFunction()
+    return embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name=settings.embedding_model_name
+    )
+```
+
+## Top-k retrieval
+
+On each question, `retrieve_relevant_schema` embeds the question text with the same embedding function used at index-build time (so both live in the same vector space), then queries the selected database's Chroma collection for the `SCHEMA_TOP_K` most similar table DDLs (default 4). Similarity scores are `1 - cosine_distance`, bounded [0, 1].
+
+A `MISSING_REFERENCE` execution error re-enters this node with `top_k` widened by 2 (`settings.schema_top_k + 2`) and the error text folded into the retrieval query. The error usually names the missing identifier, making it genuinely useful signal for the similarity search.
+
+<Tip>
+  Tune `SCHEMA_TOP_K` in `.env` if retrieval consistently misses relevant tables or consistently includes irrelevant ones. Start with the default of 4 and increase by 1–2 for schemas with many closely-related tables.
+</Tip>
+
+## FK-adjacency bridge expansion
+
+Pure text-similarity retrieval has a systematic blind spot: tables with mostly numeric columns (fact tables like `FactInternetSales`) embed weakly against natural-language questions even when they are the structurally required connector between two concepts. Without a fix, the model doesn't fail loudly — it invents a plausible-looking but nonexistent shortcut.
+
+`embeddings/retriever.py::_expand_with_fk_bridges` fixes this generically, without needing to know which tables matter for which questions. At index-build time, each table's FK targets are stored in Chroma's metadata:
+
+```python
+# embeddings/schema_indexer.py — metadata stored per table at index time
+metadatas=[
+    {
+        "table_name": table.table_name,
+        "db_name": db_name,
+        # Comma-joined referred-table names for FK-adjacency bridge expansion
+        "fk_targets": ",".join(sorted({fk.referred_table for fk in table.foreign_keys})),
+    }
+    for table in tables
+],
+```
+
+At retrieval time, the algorithm:
+
+<Steps>
+  <Step title="Find connected components">
+    Treat the retrieved tables as nodes in the full FK graph and find the **connected components** of the subgraph they induce (edges only between two already-retrieved tables). If everything is one island, nothing to bridge.
+  </Step>
+  <Step title="Find the shortest connecting path">
+    If there are multiple islands, run a BFS over the **full** schema FK graph (not just retrieved tables) to find the shortest real path between the two closest islands, then add that path's intermediate tables.
+  </Step>
+  <Step title="Repeat until unified">
+    Recompute components and repeat until everything is one connected island, a connecting path would need more than `_MAX_BRIDGE_PATH_HOPS` intermediate tables (treated as genuinely unrelated), or the bridge budget (`_MAX_BRIDGE_TABLES = 5`) runs out.
+  </Step>
+</Steps>
+
+<Note>
+  This algorithm handles **two or more consecutive missing hops** — e.g., both a fact table and an intermediate dimension missing at once. An earlier, simpler approach (checking only local adjacency) could not bootstrap into a two-gap case because neither missing table starts out adjacent to two already-selected tables. Finding the actual shortest connecting path closes gaps of any length up to the hop cap.
+</Note>
+
+## Value sampling: fixing "the column name lied to me"
+
+A column like `DimProduct.ProductLine` looks, from its name and type alone, like it could hold almost anything. It actually holds short codes (`M`/`R`/`S`/`T`) — nothing like a business term such as "Bikes." Left alone, a model will sometimes filter on a column whose name sounds right rather than the one whose values actually match.
+
+`db/value_sampling.py` addresses this by sampling real `DISTINCT` values for qualifying columns and rendering them as a DDL comment (`-- e.g. 'M', 'R', 'S', 'T'`). The qualifying criteria are narrow by design:
+
+- Only string-family columns (`VARCHAR`/`CHAR`/`NVARCHAR`/`NCHAR`)
+- Never a primary key or foreign key column (those are join plumbing, not descriptive values)
+- Declared column length capped (skip large free-text columns)
+- Distinct-value count capped at **20** — a column with more than 20 distinct values is either not a "code" column or is high-cardinality enough to plausibly be PII (names, emails)
+
+<Info>
+  The 20-distinct-value cap is what makes value sampling privacy-safe **by construction** — real PII columns are high-cardinality by nature and never pass it, without needing a column-name denylist. Names, email addresses, and phone numbers will not appear in the embedded schema index.
+</Info>
+
+## Table descriptions: applied fresh, never baked in
+
+`config/table_descriptions.yaml` holds hand-reviewed, plain-language descriptions of what each table means and how it relates to others, including per-column disambiguation notes. It is deliberately **not** embedded into the Chroma index at build time.
+
+Baking descriptions into the index would freeze them as of the last `build_embeddings.py` run — editing the file to fix a wrong note wouldn't take effect until someone remembered to rebuild. Instead, `retrieve_schema_node` calls `config.table_descriptions.load_table_descriptions()` — which re-parses the YAML from disk on every single call, with no caching layer — and overlays the current file content onto whatever DDL came back from retrieval. A hand-edit takes effect on the very next question, with zero rebuild step.
+
+<Warning>
+  Table descriptions are intentionally **not** used as the embedding text. Measured against the project's own benchmark, embedding description prose alongside DDL did more harm than good: a description phrase from an unrelated table (e.g., "orders placed" in a call-center metrics description) can coincidentally match a question ahead of the actually-relevant table. Business terminology is better handled via column-name and table-name lexical bonuses at retrieval time.
+</Warning>
+
+## Building and refreshing the index
+
+The schema index is built by `embeddings.schema_indexer.refresh_all_schema_indexes()`, callable in two ways:
+
+```bash
+# CLI (run once after initial setup, and after any schema change)
+python scripts/build_embeddings.py
+
+# Or force a full rebuild, ignoring the cached fingerprint
+python scripts/build_embeddings.py --force
+```
+
+```bash
+# REST API (triggers the same function)
+curl -X POST http://localhost:8000/schema/refresh
+```
+
+Re-embedding is skipped whenever `db.schema_introspection.get_schema_fingerprint()` — a SHA-256 hash of the introspected tables (pre-value-sampling, so incidental data changes don't force unnecessary rebuilds) — matches the hash stored alongside the Chroma persist directory. The fingerprint file is named `.schema_hash__{db_name}`, one per configured database, so refreshing one database never touches another's index.
+
+## Per-database collections and multi-database routing
+
+Every configured database gets its own Chroma collection for schema DDL and a separate collection for golden examples:
+
+| Collection | Name pattern | Purpose |
+|---|---|---|
+| Schema DDL | `{CHROMA_COLLECTION_NAME}__{db_name}` | Table DDL + sampled values, one chunk per table |
+| Golden examples | `golden_examples__{db_name}` | Human-approved (question, SQL) pairs from thumbs-up feedback |
+
+When more than one database is configured, `embeddings.retriever.select_database` runs first to pick the most schema-relevant database before any table-level retrieval. The selected database is stored in `state["selected_database"]` and never re-selected during a run — retries always target the same database the initial attempt used.
+
+## Golden examples collection
+
+The golden examples store uses the exact same ChromaDB pattern, embedding function, and cosine-distance configuration as the schema DDL store. Human-approved (question, SQL) pairs are saved via `embeddings.golden_examples.save_golden_example` whenever a user clicks thumbs-up on a confirmed result in the dashboard. On the next similar question, `retrieve_golden_examples_node` queries `golden_examples__{db_name}` and injects any pairs clearing `GOLDEN_EXAMPLES_MIN_SIMILARITY` (default 0.75) into `generate_sql_node`'s prompt as few-shot reference material.
+
+Saving a golden example uses `collection.upsert` with a deterministic SHA-256 ID derived from `(db_name, question, sql)` — clicking thumbs-up twice on the same result upserts rather than duplicating.

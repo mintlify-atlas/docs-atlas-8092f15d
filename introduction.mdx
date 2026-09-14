@@ -1,0 +1,76 @@
+---
+title: "Text-to-SQL Agent: Natural Language to SQL"
+sidebarTitle: "Introduction"
+description: "A LangGraph agent that turns plain-English questions into validated SQL — local Ollama LLM, AST allowlist, self-correcting retries, and ChromaDB retrieval."
+---
+
+The Text-to-SQL Agent lets you ask your own database a question in plain English and get back validated, read-only SQL that you review before it ever runs. A LangGraph state machine turns the natural-language question into SQL, validates it against a strict AST-based allowlist, estimates execution cost, runs it against your database, and optionally produces a grounded plain-English insight — all without sending a single byte of your data or your schema to a hosted cloud API. The LLM runs locally via [Ollama](https://ollama.com); ChromaDB retrieves only the schema tables relevant to each question. If the generated SQL fails validation or execution, the agent routes back to regeneration with the error appended to context, up to an adaptive retry budget.
+
+<Note>
+  **Alpha software with known accuracy limitations.** The latest benchmark run (57 cases, `llama3.1:8b` against AdventureWorksDW2025) measured **92.3% execution accuracy** but only **29.6% result-set accuracy** and **35.0% final accuracy** — the SQL often runs successfully but returns the wrong answer, especially on hard and real-world questions (25% pass rate each). Security-rejection accuracy is 100%. See [Evaluation](/guides/evaluation) for the full per-difficulty and per-category breakdown before relying on this in any production context.
+</Note>
+
+## What problem does it solve?
+
+Writing SQL by hand requires knowing exact table names, column names, joins, and dialect quirks for every question you want answered. The Text-to-SQL Agent automates that translation, enforces a read-only safety boundary, and gives you the generated SQL to inspect before committing to running it. The schema is not dumped wholesale into the prompt — ChromaDB embeds each table's DDL and retrieves only the top-k most relevant tables per question, with foreign-key adjacency bridge expansion to capture structurally required tables that plain similarity search tends to miss.
+
+## Key differentiators
+
+<CardGroup cols={2}>
+  <Card title="Local LLM via Ollama" icon="microchip">
+    SQL generation runs entirely on your machine. No API keys, no data leaving your network. Any model you can `ollama pull` works — the project is built and benchmarked against `llama3.1:8b`.
+  </Card>
+  <Card title="AST-based SQL validation" icon="shield-check">
+    Generated SQL is parsed by `sqlglot` and checked against an explicit allowlist (`SELECT`, `UNION`, `EXCEPT`, `INTERSECT` only) — not a keyword blocklist that a syntax variant could slip past. Security-rejection accuracy is 100% across all 20 adversarial benchmark cases.
+  </Card>
+  <Card title="Self-correcting agent graph" icon="arrows-rotate">
+    An explicit 11-node LangGraph state machine routes validation and execution failures back to the generation node with error context appended. The retry budget widens adaptively for queries flagged as complex by `agent/complexity.py`.
+  </Card>
+  <Card title="Schema-aware ChromaDB retrieval" icon="database">
+    Each table's DDL is embedded separately. Only the top-k relevant tables are retrieved per question, extended via FK-adjacency bridge expansion. A golden-dataset feedback loop injects human-approved `(question, SQL)` pairs as few-shot examples for similar future questions.
+  </Card>
+  <Card title="Multi-database auto-routing" icon="shuffle">
+    Configure more than one database in `.env`; the agent automatically routes each question to whichever database's schema looks most relevant — no manual picker.
+  </Card>
+  <Card title="Grounded insights" icon="chart-bar">
+    An optional plain-English summary sentence is checked against the actual result rows before display. A number not supported by the data is silently dropped rather than shown as if verified.
+  </Card>
+</CardGroup>
+
+## Architecture overview
+
+The core pipeline is an 11-node LangGraph state machine. A question enters through `sanitize_input`, is classified as a standalone question or a follow-up, then routes to `retrieve_schema` (ChromaDB top-k + FK-adjacency bridge) and `retrieve_golden_examples` (few-shot examples from past approved results). For complex queries, an optional `plan_query` node produces a structured plan that a subsequent `review_sql` node checks for conformance. `generate_sql` calls Ollama; `validate_sql` runs the `sqlglot` AST allowlist check; `estimate_cost` runs a non-executing `EXPLAIN`/`SHOWPLAN`; and `execute_sql` runs the query read-only against your database.
+
+For a full walkthrough of each node, the retry-routing table, and the FK-adjacency bridge expansion logic, see the [Architecture](/concepts/architecture) reference.
+
+## Supported databases
+
+| `DB_TYPE` value | Driver | Notes |
+|---|---|---|
+| `postgresql` | `psycopg2-binary` | |
+| `mysql` | `pymysql` | |
+| `mssql` | `pyodbc` | Requires the Microsoft ODBC Driver 17/18 for SQL Server installed as a system package — see [Troubleshooting](/troubleshooting). |
+| `oracle` | `oracledb` (thin mode) | No separate Oracle Client install needed. |
+
+Selected via `DB_TYPE` in `.env` for a single database, or `DB_CONNECTIONS=name1,name2,...` for multiple auto-routed databases. The source of truth is `db/connection.py::SUPPORTED_DB_TYPES`.
+
+## Project status
+
+This project is **alpha** and evolving quickly. The React dashboard is the only UI — a previous Streamlit app was removed once the dashboard reached full feature parity with it. The project is **not** hardened for concurrent multi-tenant or production use. Review [`SECURITY.md`](https://github.com/surajkumarnavodya/text-to-sql-agent-langgraph/blob/main/SECURITY.md) and the [Production Checklist](/security/production-checklist) before pointing it at anything sensitive.
+
+## Explore further
+
+<CardGroup cols={2}>
+  <Card title="Quickstart (local)" icon="play" href="/quickstart">
+    Clone, configure, index your schema, and make your first API call — all in one guided walkthrough.
+  </Card>
+  <Card title="Docker Quickstart" icon="docker" href="/quickstart-docker">
+    Run the full stack in a single container using Docker Compose, with a persistent Chroma volume.
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    Deep dive into the 11-node LangGraph graph, the retry-routing table, and FK-adjacency bridge expansion.
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/overview">
+    Every REST endpoint, request/response schema, and the optional bearer-token auth model.
+  </Card>
+</CardGroup>

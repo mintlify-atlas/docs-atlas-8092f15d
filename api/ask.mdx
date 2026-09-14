@@ -1,0 +1,273 @@
+---
+title: "POST /ask — Run a Natural-Language SQL Question"
+sidebarTitle: "POST /ask"
+description: "Run a natural-language question through the full agent graph: schema retrieval, SQL generation, self-correction, and read-only execution with insight."
+---
+
+The `/ask` endpoint is the heart of the Text-to-SQL agent. A single POST carries your question through the entire pipeline: input guard, ChromaDB schema retrieval, optional query planning for complex questions, SQL generation, plan-conformance review, validation, cost estimation, read-only execution, self-correction on failure, and a plain-English insight sentence. Every safety layer — the SELECT-only validator, the row cap, query timeout, sensitive-column blocking, and the LLM-call rate limiter — applies unconditionally because this endpoint is a direct pass-through to `agent.graph.run_agent`; there is no secondary code path that could drift from those rules.
+
+<Note>
+The API is **stateless**. There is no server-side session. If you need follow-up question resolution (e.g., "how about last year?"), you must resend recent turns in `conversation_history` on every request. The React dashboard reconstructs this automatically from its own `chatStore`; programmatic callers must do the same.
+</Note>
+
+## Endpoint
+
+```
+POST /ask
+```
+
+## Authentication
+
+When `API_AUTH_TOKEN` is set in your environment, every request must include a matching `Authorization` header. The comparison is constant-time to prevent timing attacks.
+
+```
+Authorization: Bearer <your-token>
+```
+
+Requests missing or mismatching the token receive `401 Unauthorized`. `GET /health` is the only endpoint that never requires auth.
+
+## Rate Limiting
+
+A per-client-IP question limiter enforces `QUESTION_RATE_LIMIT_PER_MINUTE` (default: `10`). When the limit is exceeded the API returns `429 Too Many Requests` with a `Retry-After` header indicating how many seconds to wait. A separate process-wide LLM-call limiter (`LLM_CALL_RATE_LIMIT_PER_MINUTE`) applies inside the agent graph itself and is not configurable per endpoint.
+
+## Request Body
+
+<ParamField body="question" type="string" required>
+  The natural-language question to answer. Whitespace is stripped. Must be at least 1 character. The effective maximum length is `MAX_QUESTION_LENGTH` (default `500`) and is enforced by the agent's input guard — exceeding it yields `status: "rejected"` with `rejection_reason: "too_long"` rather than a validation error.
+</ParamField>
+
+<ParamField body="conversation_history" type="ConversationExchangeIn[]">
+  Recent prior turns, oldest first, used for follow-up reference resolution (e.g., resolving "those customers" back to the table used in the previous turn). Optional — omit for the first question in a session. The server never stores history; the caller must resend it each request.
+
+  <Expandable title="ConversationExchangeIn fields">
+    <ParamField body="question" type="string" required>
+      The exact question text from the prior turn.
+    </ParamField>
+    <ParamField body="sql" type="string | null">
+      The SQL generated in that prior turn, or `null` if the turn did not produce SQL.
+    </ParamField>
+    <ParamField body="tables" type="string[]">
+      Table names referenced in that turn's SQL. Defaults to `[]`.
+    </ParamField>
+    <ParamField body="status" type="AgentStatus">
+      Outcome of that prior turn — e.g. `"succeeded"`, `"failed"`. Defaults to `"succeeded"`.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField body="enable_insight" type="boolean" default="true">
+  Whether to generate a plain-English insight sentence summarising the result after successful execution. Set to `false` to skip the extra LLM call and reduce latency when you only need raw rows.
+</ParamField>
+
+<ParamField body="session_id" type="string | null">
+  Caller-supplied conversation identifier, max 128 characters. Omit on the first turn — the API generates a UUID and returns it in `AskResponse.session_id`. Pass the same value back on every subsequent turn of that conversation. The API is still stateless today (it does not gate or scope anything by `session_id`); this field is a correlation token and the hook future server-side session state will key off.
+</ParamField>
+
+## Response Fields
+
+<ResponseField name="status" type="string" required>
+  The terminal outcome of the agent run. Check this before trusting any other field.
+
+  | Value | Meaning |
+  |---|---|
+  | `succeeded` | SQL generated and executed successfully; `result_rows` is populated. |
+  | `failed` | All retry attempts exhausted without a valid SQL result. |
+  | `rejected` | Question refused by the input guard (unsafe, too long, DML attempt, etc.). |
+  | `needs_clarification` | The agent could not determine intent; `clarification_message` explains what to provide. |
+  | `rate_limited` | Per-session LLM-call budget exhausted; `rate_limit_message` is set. |
+</ResponseField>
+
+<ResponseField name="session_id" type="string" required>
+  Echoes the `session_id` from the request, or a freshly generated UUID if none was supplied. Pass this back on the next request in the same conversation.
+</ResponseField>
+
+<ResponseField name="database" type="string | null">
+  The configured database name (`Settings.databases[i].name`) the question was auto-routed to. `"default"` for a plain single-database setup. `null` when no routing occurred (e.g. a rejected question).
+</ResponseField>
+
+<ResponseField name="sql" type="string | null">
+  The final validated SQL string — exactly what was (or would be) executed. `null` unless `status` is `"succeeded"`.
+</ResponseField>
+
+<ResponseField name="result_columns" type="string[] | null">
+  Column names of the result set, in order.
+</ResponseField>
+
+<ResponseField name="result_rows" type="any[][] | null">
+  Result rows as a list of lists. Each inner list is one row, values ordered to match `result_columns`. Capped to `MAX_ROWS` (default `500`).
+</ResponseField>
+
+<ResponseField name="row_count" type="integer | null">
+  Number of rows returned (length of `result_rows`).
+</ResponseField>
+
+<ResponseField name="retry_count" type="integer">
+  How many self-correction retries the agent performed (0 = first attempt succeeded).
+</ResponseField>
+
+<ResponseField name="attempt_history" type="AttemptRecordOut[]">
+  One record per SQL generation attempt, in order. Each entry includes:
+  - `attempt` (integer) — 1-based attempt number
+  - `sql` (string | null) — the SQL tried
+  - `outcome` (string) — e.g. `"succeeded"`, `"validation_error"`, `"execution_error"`
+  - `error` (string | null) — the error message that caused a retry, if any
+  - `will_retry` (boolean) — whether another attempt will follow
+</ResponseField>
+
+<ResponseField name="insight" type="string | null">
+  A one-sentence plain-English summary of the result, generated after successful execution. `null` if `enable_insight` was `false`, if generation failed, or if `status != "succeeded"`.
+</ResponseField>
+
+<ResponseField name="cost_notice" type="string | null">
+  A human-readable warning when the query is estimated to scan an unusually large number of rows. `null` in most cases.
+</ResponseField>
+
+<ResponseField name="low_confidence_notice" type="string | null">
+  Set when the SQL joined multiple tables and returned zero rows — a detection signal that the join conditions may be overly restrictive, not necessarily an error.
+</ResponseField>
+
+<ResponseField name="rejection_reason" type="string | null">
+  Machine-readable rejection code when `status` is `"rejected"`. Example values: `"too_long"`, `"unsafe"`, `"dml_attempt"`, `"ambiguous"`.
+</ResponseField>
+
+<ResponseField name="rejection_message" type="string | null">
+  Human-readable explanation of the rejection, safe to display to end users.
+</ResponseField>
+
+<ResponseField name="clarification_message" type="string | null">
+  When `status` is `"needs_clarification"`, a prompt explaining what additional information is needed.
+</ResponseField>
+
+<ResponseField name="failure_explanation" type="string | null">
+  When `status` is `"failed"`, a short explanation of what went wrong after all retries were exhausted.
+</ResponseField>
+
+<ResponseField name="error_history" type="string[]">
+  The sequence of validation or execution error messages across all retry attempts, in order.
+</ResponseField>
+
+<ResponseField name="query_plan" type="string[] | null">
+  Ordered plan steps produced for a question `agent/complexity.py` judged non-trivial (e.g. top-N-per-group, year-over-year growth, multiple aggregations). `null` when planning was skipped — the vast majority of questions. When non-null, the generated SQL was checked for conformance to this plan before execution.
+</ResponseField>
+
+<ResponseField name="schema_tables" type="SchemaTableOut[]">
+  The schema context chunks retrieved from ChromaDB for this question. Each entry has `table_name`, `ddl`, and `similarity_score`. Rendered by the dashboard's "Retrieved schema context" expander.
+</ResponseField>
+
+<ResponseField name="followup_classification" type="string | null">
+  Whether the question was classified as `"standalone"`, `"followup"`, or `"ambiguous"` relative to the conversation history. `null` when no history was provided.
+</ResponseField>
+
+<ResponseField name="followup_resolved_against" type="ConversationExchangeOut | null">
+  The specific prior turn a follow-up question was resolved against — useful for rendering "Following up on: …" context. `null` for standalone questions.
+</ResponseField>
+
+<ResponseField name="sources_used" type="string[]">
+  Which sources contributed to the answer, e.g. `["sql"]` or `["sql", "policy"]`. Only meaningful when `ENABLE_MULTI_SOURCE_ROUTER` is on — empty otherwise (clients should assume `["sql"]`).
+</ResponseField>
+
+<ResponseField name="synthesized_answer" type="string | null">
+  A combined prose answer when two or more sources contributed. `null` when only one source was used. Only populated when `ENABLE_MULTI_SOURCE_ROUTER` is on.
+</ResponseField>
+
+## Example Request
+
+```bash
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-token" \
+  -d '{
+    "question": "What were total internet sales by year?",
+    "enable_insight": true,
+    "session_id": "conv-abc123"
+  }'
+```
+
+## Example Response
+
+```json
+{
+  "status": "succeeded",
+  "session_id": "conv-abc123",
+  "database": "default",
+  "sql": "SELECT YEAR(OrderDate) AS SalesYear, SUM(SalesAmount) AS TotalSales FROM FactInternetSales GROUP BY YEAR(OrderDate) ORDER BY SalesYear",
+  "result_columns": ["SalesYear", "TotalSales"],
+  "result_rows": [
+    [2010, 43421.04],
+    [2011, 1092193.75],
+    [2012, 3825334.52]
+  ],
+  "row_count": 3,
+  "retry_count": 0,
+  "attempt_history": [
+    {
+      "attempt": 1,
+      "sql": "SELECT YEAR(OrderDate) AS SalesYear, SUM(SalesAmount) AS TotalSales FROM FactInternetSales GROUP BY YEAR(OrderDate) ORDER BY SalesYear",
+      "outcome": "succeeded",
+      "error": null,
+      "will_retry": false
+    }
+  ],
+  "insight": "Internet sales grew from $43K in 2010 to over $3.8M in 2012.",
+  "cost_notice": null,
+  "low_confidence_notice": null,
+  "rejection_reason": null,
+  "rejection_message": null,
+  "clarification_message": null,
+  "failure_explanation": null,
+  "error_history": [],
+  "query_plan": null,
+  "schema_tables": [
+    {
+      "table_name": "FactInternetSales",
+      "ddl": "CREATE TABLE FactInternetSales (SalesOrderNumber NVARCHAR(20), ..., SalesAmount MONEY, OrderDate DATETIME, ...)",
+      "similarity_score": 0.91
+    }
+  ],
+  "followup_classification": "standalone",
+  "followup_resolved_against": null,
+  "sources_used": [],
+  "synthesized_answer": null
+}
+```
+
+## Example: Follow-up Question
+
+```bash
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-token" \
+  -d '{
+    "question": "How about by product category instead?",
+    "session_id": "conv-abc123",
+    "conversation_history": [
+      {
+        "question": "What were total internet sales by year?",
+        "sql": "SELECT YEAR(OrderDate) AS SalesYear, SUM(SalesAmount) AS TotalSales FROM FactInternetSales GROUP BY YEAR(OrderDate) ORDER BY SalesYear",
+        "tables": ["FactInternetSales"],
+        "status": "succeeded"
+      }
+    ],
+    "enable_insight": true
+  }'
+```
+
+## Error Codes
+
+| HTTP Status | Meaning |
+|---|---|
+| `200` | Request processed; inspect `status` in the body for agent outcome. |
+| `401` | Missing or invalid `Authorization` header (only when `API_AUTH_TOKEN` is set). |
+| `422` | Request body failed schema validation (e.g. empty `question`). |
+| `429` | Per-IP question rate limit exceeded; obey the `Retry-After` response header. |
+| `500` | Unexpected server error; check the application logs. |
+
+<Warning>
+A `200` response does **not** mean the question was answered successfully. Always check `status` first — a rejected or failed run returns HTTP `200` with a non-`succeeded` status and relevant `rejection_message` or `failure_explanation`.
+</Warning>
+
+## Multi-Source Fields
+
+<Info>
+The fields `sources_used`, `synthesized_answer`, `document_result`, `policy_result`, `web_result`, `generation_result`, and `media_search_result` are only meaningful when `ENABLE_MULTI_SOURCE_ROUTER=true`. In a standard single-database deployment these fields are always empty/null, and clients should assume `sources_used = ["sql"]`.
+</Info>

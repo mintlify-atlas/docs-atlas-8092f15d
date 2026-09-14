@@ -1,0 +1,210 @@
+---
+title: "Run the Text-to-SQL Agent with Docker Compose"
+sidebarTitle: "Docker"
+description: "Build one container image for the REST API and React dashboard, wire it to your host Ollama and database, and keep the Chroma schema index across restarts."
+---
+
+The Docker Compose setup builds a single container image from the project's multi-stage `Dockerfile` — a Node.js stage compiles the React dashboard, and a Python stage (non-root, pinned dependencies, health-checked) serves both the REST API and the built static files on port 8000. Ollama and your target database are deliberately **not** included as Compose services; both are external and user-provided, matching the project's architecture of connecting to a database you already own. This guide shows you how to wire them together.
+
+<Warning>
+  **Review security posture before exposing the service.** The `docker-compose.yml` binds to `127.0.0.1:8000` by default — not all network interfaces. Read [`SECURITY.md`](https://github.com/surajkumarnavodya/text-to-sql-agent-langgraph/blob/main/SECURITY.md) and the [Production Checklist](/security/production-checklist) before widening that binding or placing this behind a public-facing load balancer.
+</Warning>
+
+## Prerequisites
+
+- **Docker** and **Docker Compose** (Docker Engine 20.10+ on Linux, or Docker Desktop on Windows/macOS).
+- **Ollama running on the host** with the model already pulled:
+  ```bash
+  ollama pull llama3.1:8b
+  ```
+- **A real database** — PostgreSQL, MySQL, SQL Server (`mssql`), or Oracle — reachable from the Docker container over your network.
+
+## Setup steps
+
+<Steps>
+  ### Copy the environment file and configure it
+
+  ```bash
+  cp .env.example .env
+  ```
+
+  Open `.env` and set your database credentials and Ollama host. At minimum, configure the `DB_*` block and `OLLAMA_HOST`:
+
+  ```bash
+  # Point to Ollama running on the host (see step below for the hostname)
+  OLLAMA_HOST=http://host.docker.internal:11434
+  OLLAMA_MODEL=llama3.1:8b
+
+  # Your database — use a dedicated read-only account
+  DB_TYPE=postgresql
+  DB_HOST=your-db-host
+  DB_PORT=5432
+  DB_NAME=your_database
+  DB_USER=your_readonly_user
+  DB_PASSWORD=your_password
+  ```
+
+  The `docker-compose.yml` binds the API port to `127.0.0.1` by default. To change the bind address (e.g. for a reverse proxy), set `API_BIND_HOST` in `.env`:
+
+  ```bash
+  # Default: localhost only
+  API_BIND_HOST=127.0.0.1
+  ```
+
+  <Warning>
+    **`DB_TYPE=mssql` requires an extra image layer.** The base image includes `unixodbc-dev` for pyodbc's build dependency, but **not** the Microsoft ODBC Driver 17/18 itself — that is a separate install from Microsoft's apt repository. Extend the base image with:
+
+    ```dockerfile
+    FROM text-to-sql-dashboard:latest
+    USER root
+    RUN curl -sSL -O https://packages.microsoft.com/config/debian/12/packages-microsoft-prod.deb \
+        && dpkg -i packages-microsoft-prod.deb \
+        && apt-get update \
+        && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 \
+        && rm -rf /var/lib/apt/lists/* packages-microsoft-prod.deb
+    USER app
+    ```
+
+    This is kept out of the base image intentionally so that PostgreSQL, MySQL, and Oracle deployments don't carry the extra weight.
+  </Warning>
+
+  ### Connect Docker to host Ollama
+
+  The `docker-compose.yml` declares `extra_hosts: ["host.docker.internal:host-gateway"]`, which makes the special hostname `host.docker.internal` resolve to your host machine from inside the container. Set `OLLAMA_HOST` in `.env` to use it:
+
+  ```bash
+  OLLAMA_HOST=http://host.docker.internal:11434
+  ```
+
+  This works automatically on Docker Desktop (Windows and macOS). On Linux with Docker Engine 20.10+, the `host-gateway` mapping makes it resolve too. If your Ollama runs on a separate host or a dedicated server, point `OLLAMA_HOST` at that address instead — no other change is needed.
+
+  ### Build the image
+
+  ```bash
+  docker compose build
+  ```
+
+  This runs the multi-stage build: Node 22 compiles the React dashboard (`frontend/`), then Python 3.11 assembles the application layer. The built dashboard static files are baked into the same image — one container, one port.
+
+  ### Start the container
+
+  ```bash
+  docker compose up -d
+  ```
+
+  The container starts in detached mode. The `api` service has a health check that hits `GET /health`, which verifies the database, Ollama, and the Chroma index are all reachable — not just that the process is running.
+
+  Check container status and logs:
+
+  ```bash
+  docker compose ps
+  docker compose logs -f api
+  ```
+
+  ### Build the schema index (one-time)
+
+  ```bash
+  docker compose exec api python scripts/build_embeddings.py
+  ```
+
+  This introspects your database's live schema, embeds each table's DDL, and stores the vectors in the persistent `chroma_index` volume. You only need to run this once after the container is first started — and again after any real schema change. The script skips re-embedding tables whose DDL fingerprint has not changed, so it is cheap to re-run defensively.
+
+  <Note>
+    **The `chroma_index` volume persists across restarts.** The Chroma schema index is stored in a named Docker volume (`chroma_index`) mounted at `/app/embeddings/.chroma`. Container restarts and image rebuilds do **not** clear this volume — your index survives as long as the volume exists. Only `docker compose down -v` or an explicit `docker volume rm chroma_index` removes it.
+  </Note>
+
+  ### Access the dashboard and API
+
+  Open your browser at:
+
+  ```
+  http://localhost:8000/
+  ```
+
+  The dashboard UI and the REST API are both served from this address. Verify the API is healthy:
+
+  ```bash
+  curl http://localhost:8000/health
+  ```
+
+  Make a test query:
+
+  ```bash
+  curl -X POST http://localhost:8000/ask \
+    -H "Content-Type: application/json" \
+    -d '{"question": "What were total sales last quarter?", "enable_insight": true}'
+  ```
+</Steps>
+
+## Stopping the stack
+
+```bash
+# Stop and remove containers, but keep the chroma_index volume
+docker compose down
+
+# Stop and remove containers AND the persistent chroma_index volume
+# (you will need to run build_embeddings.py again after your next `up`)
+docker compose down -v
+```
+
+## Rebuilding after a schema change
+
+If your database schema changes, rebuild the index inside the running container:
+
+```bash
+docker compose exec api python scripts/build_embeddings.py
+```
+
+The `chroma_index` volume is not affected by `docker compose build` or `docker compose up --build` — those commands rebuild the image, not the volume contents.
+
+## Configuration reference
+
+The full set of `.env` variables that affect the Docker deployment:
+
+| Variable | Example | Purpose |
+|---|---|---|
+| `OLLAMA_HOST` | `http://host.docker.internal:11434` | Ollama server URL from inside the container |
+| `OLLAMA_MODEL` | `llama3.1:8b` | Model name to use for SQL generation |
+| `DB_TYPE` | `postgresql` | Database driver (`postgresql`, `mysql`, `mssql`, `oracle`) |
+| `DB_HOST` | `your-db-host` | Database host reachable from the container |
+| `DB_PORT` | `5432` | Database port |
+| `DB_NAME` | `your_database` | Database name |
+| `DB_USER` | `your_readonly_user` | Read-only database account |
+| `DB_PASSWORD` | `your_password` | Database password |
+| `API_BIND_HOST` | `127.0.0.1` | Host interface for the `8000:8000` port mapping |
+| `API_AUTH_TOKEN` | _(leave blank)_ | Optional bearer token for all API requests |
+| `CHROMA_PERSIST_DIR` | `./embeddings/.chroma` | Path inside the container where Chroma stores the index |
+
+See the full [Configuration Reference](/guides/configuration) for all available variables, including agent limits, rate limiting, multi-source RAG, voice mode, and media generation options.
+
+<Accordion title="Persistent volume details">
+  The named volume `chroma_index` is declared in `docker-compose.yml`:
+
+  ```yaml
+  volumes:
+    chroma_index:
+  ```
+
+  It is mounted at `/app/embeddings/.chroma` inside the `api` container, matching `CHROMA_PERSIST_DIR` in `.env`. Because the volume is named (not a bind mount), Docker manages its lifecycle independently of both the container and the image. To inspect it:
+
+  ```bash
+  docker volume inspect text-to-sql-agent-langgraph_chroma_index
+  ```
+</Accordion>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Local Quickstart" icon="play" href="/quickstart">
+    Prefer running without Docker? The local setup guide covers `venv`, `pip install`, and `uvicorn` directly.
+  </Card>
+  <Card title="Deployment Guide" icon="server" href="/guides/deployment">
+    Reverse proxy setup, horizontal scaling considerations, production secrets, and more.
+  </Card>
+  <Card title="Configuration Reference" icon="sliders" href="/guides/configuration">
+    Every `.env` variable — including optional features like voice mode, multi-source RAG, and media generation.
+  </Card>
+  <Card title="Troubleshooting" icon="wrench" href="/troubleshooting">
+    Common failure modes including SQL Server ODBC driver errors, Ollama connectivity, and ChromaDB issues.
+  </Card>
+</CardGroup>

@@ -1,0 +1,287 @@
+---
+title: "Media Generation, Search, and Asset Retrieval APIs"
+sidebarTitle: "Media"
+description: "Confirm pending AI image and video generation proposals, retrieve bytes by opaque ID, search the media library, and stream matched library assets."
+---
+
+The media endpoints cover two distinct workflows. The **generation** workflow (`POST /generate/confirm`, `GET /media/{media_id}`) handles AI-generated images and videos: a prior `POST /ask` response proposes a generation when `generation_result.status == "pending_approval"`, and this endpoint is what actually calls the IMA Studio provider and charges you. The **library** workflow (`POST /search/media`, `GET /media/library/{media_id}`) searches a persistent ChromaDB-backed collection of your own existing images and video segments by natural-language description, then streams the matched asset's bytes.
+
+The two `GET` routes are intentionally separate: `GET /media/{media_id}` serves freshly *generated* bytes from a bounded in-process cache (process-lifetime only, 100-entry LRU, no persistence), while `GET /media/library/{media_id}` resolves against the persistent on-disk media library and path-validates the result before opening it. Never mix IDs across the two routes — they are opaque and scoped to their respective stores.
+
+<Warning>
+**IMA Studio media generation costs real money.** Every successful `POST /generate/confirm` call invokes the IMA Studio API and is billed against your provider account. The default `REQUIRE_GENERATION_APPROVAL=true` setting in `.env` intentionally holds generation at `pending_approval` status in `POST /ask` until you explicitly confirm here — so that no generation happens and no cost is incurred until you review the proposal. Do not set `REQUIRE_GENERATION_APPROVAL=false` in production without understanding the billing implications.
+</Warning>
+
+---
+
+## POST /generate/confirm
+
+Executes a media-generation proposal that a prior `POST /ask` left in `pending_approval` state. This is the only route that actually calls the IMA Studio provider API — the agent's `generation_node` stops short of doing so when `Settings.require_generation_approval` is `true` (the default). The media kind (image vs. video) is always re-inferred server-side from `question`; it is never accepted from the client, so a caller cannot misrepresent a more expensive video request as a cheaper image one.
+
+This endpoint is only meaningful when both `ENABLE_MULTI_SOURCE_ROUTER=true` and `ENABLE_MEDIA_GENERATION=true`. It requires auth if `API_AUTH_TOKEN` is set, and is rate-limited per client IP via `API_ACTION_RATE_LIMIT_PER_MINUTE` in addition to the process-wide `MEDIA_GEN_RATE_LIMIT`.
+
+### Request
+
+`Content-Type: application/json`
+
+<ParamField body="question" type="string" required>
+  The generation prompt. Typically the exact text from a prior `AskResponse.generation_result.answer` when `status == "pending_approval"`, though you may edit it before confirming — the same freedom `POST /execute` gives you to edit SQL before running it. Whitespace is stripped automatically. Must be non-empty.
+</ParamField>
+
+### Response
+
+`Content-Type: application/json`
+
+<ResponseField name="answer" type="string">
+  A human-readable description of the outcome (e.g. `"Image generated successfully."`).
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Outcome of the generation attempt. Common values: `"succeeded"`, `"failed"`, `"rate_limited"`, `"rejected"`. When `status != "succeeded"`, `media_id`, `media_type`, and `model` are all `null`.
+</ResponseField>
+
+<ResponseField name="media_id" type="string | null">
+  Opaque identifier for the generated asset. Pass to `GET /media/{media_id}` to fetch the actual bytes. `null` when `status != "succeeded"`. The raw provider CDN URL is never exposed — this ID is the only way to retrieve the asset.
+</ResponseField>
+
+<ResponseField name="media_type" type="string | null">
+  `"image"` or `"video"`. Re-inferred server-side from `question` — never from the request body. `null` when `status != "succeeded"`.
+</ResponseField>
+
+<ResponseField name="model" type="string | null">
+  The IMA Studio model name used for generation (e.g. `"seedream-4.5"`). `null` when `status != "succeeded"`.
+</ResponseField>
+
+### Example
+
+<Tabs>
+  <Tab title="curl">
+    ```bash
+    curl -s -X POST http://localhost:8000/generate/confirm \
+      -H "Authorization: Bearer $API_AUTH_TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{"question": "generate an image of monthly spend by category as a bar chart"}' \
+      | jq
+    ```
+  </Tab>
+  <Tab title="Response (200 OK)">
+    ```json
+    {
+      "answer": "Image generated successfully.",
+      "status": "succeeded",
+      "media_id": "a1b2c3d4e5f6",
+      "media_type": "image",
+      "model": "seedream-4.5"
+    }
+    ```
+  </Tab>
+  <Tab title="Response (rate limited)">
+    ```json
+    {
+      "answer": "Media generation rate limit reached. Please try again later.",
+      "status": "rate_limited",
+      "media_id": null,
+      "media_type": null,
+      "model": null
+    }
+    ```
+  </Tab>
+</Tabs>
+
+### Error Codes
+
+| Status | Condition |
+|--------|-----------|
+| `401 Unauthorized` | `API_AUTH_TOKEN` is set and the request has no matching `Authorization: Bearer` header |
+| `429 Too Many Requests` | Per-IP action rate limit exceeded (`API_ACTION_RATE_LIMIT_PER_MINUTE`) |
+| `500 Internal Server Error` | Unexpected provider or processing error (safe message only) |
+
+---
+
+## GET /media/{media_id}
+
+Fetches the raw bytes for a generated image or video by the opaque `media_id` returned in a `POST /generate/confirm` response. The asset is served from an in-process LRU cache (bounded to 100 entries, process-lifetime only — it does not survive a restart). Returns the appropriate `Content-Type` header for the media format.
+
+### Path Parameters
+
+<ParamField path="media_id" type="string" required>
+  Opaque media identifier from `MediaGenerationResultOut.media_id`. Scoped to the in-process generated-media cache — do not use IDs from `POST /search/media` hits here; use `GET /media/library/{media_id}` for those.
+</ParamField>
+
+### Response
+
+Raw media bytes with the appropriate `Content-Type` (e.g. `image/png`, `video/mp4`). There is no JSON wrapper.
+
+### Example
+
+<Tabs>
+  <Tab title="curl (save to file)">
+    ```bash
+    curl -s -X GET http://localhost:8000/media/a1b2c3d4e5f6 \
+      -H "Authorization: Bearer $API_AUTH_TOKEN" \
+      --output generated.png
+    ```
+  </Tab>
+  <Tab title="curl (show Content-Type)">
+    ```bash
+    curl -sI -X GET http://localhost:8000/media/a1b2c3d4e5f6 \
+      -H "Authorization: Bearer $API_AUTH_TOKEN"
+    # Content-Type: image/png
+    ```
+  </Tab>
+</Tabs>
+
+### Error Codes
+
+| Status | Condition |
+|--------|-----------|
+| `401 Unauthorized` | `API_AUTH_TOKEN` is set and the request is unauthenticated |
+| `404 Not Found` | `media_id` was never stored, has been evicted from the 100-entry cache, or the process has restarted since generation |
+
+---
+
+## POST /search/media
+
+Searches the persistent media library by plain-English description and returns ranked hits with a templated summary. This route is independent of the conversational `POST /ask` flow — it does not invoke the LLM and returns raw ranked results rather than a composed answer. For a natural-language answer that cites found media, use `POST /ask` instead (which routes through the orchestrator's `media_search_node`).
+
+Returns `404 Not Found` when `ENABLE_MEDIA_SEARCH=false` (off by default). Rate-limited per client IP via `API_ACTION_RATE_LIMIT_PER_MINUTE`.
+
+### Request
+
+`Content-Type: application/json`
+
+<ParamField body="query" type="string" required>
+  Plain-English description of the content you are looking for (e.g. `"photo of the site inspection"`, `"budget presentation from Q3"`). Must be non-empty. Whitespace is stripped automatically.
+</ParamField>
+
+<ParamField body="media_type" type="string" default="any">
+  Filter results by media kind. One of `"image"`, `"video"`, or `"any"`. Default is `"any"`.
+</ParamField>
+
+### Response
+
+`Content-Type: application/json`
+
+<ResponseField name="answer" type="string">
+  Templated summary of the search outcome: `"Found N result(s)."` when hits exist, or `"No matching media found."` when the library returned nothing.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  `"succeeded"` when the search ran and returned at least one hit; `"insufficient_information"` when no results matched.
+</ResponseField>
+
+<ResponseField name="hits" type="array">
+  Ranked list of matched media items. Empty array when no results matched.
+
+  <Expandable title="MediaSearchHitOut fields">
+    <ResponseField name="media_id" type="string">
+      Opaque identifier for the matched asset. Pass to `GET /media/library/{media_id}` to fetch bytes. Scoped to the persistent media library — do not use with `GET /media/{media_id}`.
+    </ResponseField>
+    <ResponseField name="media_type" type="string">
+      `"image"` or `"video"`.
+    </ResponseField>
+    <ResponseField name="caption" type="string">
+      The stored caption or description for this asset, as indexed in the media library.
+    </ResponseField>
+    <ResponseField name="timestamp_start" type="float | null">
+      For video hits: the start time in seconds of the matched scene-detected segment. `null` for image hits and for video hits without scene segmentation.
+    </ResponseField>
+    <ResponseField name="timestamp_end" type="float | null">
+      For video hits: the end time in seconds of the matched scene-detected segment. `null` for image hits and for video hits without scene segmentation.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Example
+
+<Tabs>
+  <Tab title="curl">
+    ```bash
+    curl -s -X POST http://localhost:8000/search/media \
+      -H "Authorization: Bearer $API_AUTH_TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{"query": "photo of the site inspection", "media_type": "image"}' \
+      | jq
+    ```
+  </Tab>
+  <Tab title="Response (200 OK — hits)">
+    ```json
+    {
+      "answer": "Found 2 result(s).",
+      "status": "succeeded",
+      "hits": [
+        {
+          "media_id": "lib_abc123",
+          "media_type": "image",
+          "caption": "Site inspection — east wing, 2024-03-15",
+          "timestamp_start": null,
+          "timestamp_end": null
+        },
+        {
+          "media_id": "lib_def456",
+          "media_type": "image",
+          "caption": "Site inspection — roof assessment, 2024-03-15",
+          "timestamp_start": null,
+          "timestamp_end": null
+        }
+      ]
+    }
+    ```
+  </Tab>
+  <Tab title="Response (200 OK — no hits)">
+    ```json
+    {
+      "answer": "No matching media found.",
+      "status": "insufficient_information",
+      "hits": []
+    }
+    ```
+  </Tab>
+</Tabs>
+
+### Error Codes
+
+| Status | Condition |
+|--------|-----------|
+| `401 Unauthorized` | `API_AUTH_TOKEN` is set and the request is unauthenticated |
+| `404 Not Found` | `ENABLE_MEDIA_SEARCH=false` in `.env` |
+| `429 Too Many Requests` | Per-IP action rate limit exceeded (`API_ACTION_RATE_LIMIT_PER_MINUTE`) |
+
+---
+
+## GET /media/library/{media_id}
+
+Fetches the raw bytes for a media library asset — the original file for an image hit, or the representative keyframe thumbnail for a video-segment hit. Use the `media_id` values from `POST /search/media` response hits. The resolved path is validated to remain within the configured library root before the file is opened.
+
+<Note>
+This route is distinct from `GET /media/{media_id}`, which serves freshly *generated* bytes from the transient in-process cache. Library media IDs and generated media IDs are not interchangeable.
+</Note>
+
+### Path Parameters
+
+<ParamField path="media_id" type="string" required>
+  Opaque media library identifier from a `MediaSearchHitOut.media_id`. Only valid for assets indexed in the persistent Chroma-backed media library.
+</ParamField>
+
+### Response
+
+Raw media bytes with the appropriate `Content-Type` header. Full video clip streaming is not supported — video hits return a representative keyframe thumbnail, not the full clip.
+
+### Example
+
+<Tabs>
+  <Tab title="curl (save to file)">
+    ```bash
+    curl -s -X GET http://localhost:8000/media/library/lib_abc123 \
+      -H "Authorization: Bearer $API_AUTH_TOKEN" \
+      --output site_inspection.jpg
+    ```
+  </Tab>
+</Tabs>
+
+### Error Codes
+
+| Status | Condition |
+|--------|-----------|
+| `401 Unauthorized` | `API_AUTH_TOKEN` is set and the request is unauthenticated |
+| `404 Not Found` | Media search is disabled, `media_id` is unknown, or the underlying file has moved or been deleted |

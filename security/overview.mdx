@@ -1,0 +1,173 @@
+---
+title: "Security Model: What This Agent Does and Doesn't Enforce"
+sidebarTitle: "Security"
+description: "Layer-by-layer breakdown of the SQL agent's security controls — AST validation, secret redaction, input guarding — and what each layer cannot guarantee."
+---
+
+The Text-to-SQL agent treats its own LLM output as untrusted input in exactly the same way it treats a request from an unknown external caller. No amount of careful prompt engineering eliminates the fundamental risk that a language model generates unexpected output — so every piece of SQL the agent produces is passed through a structural validation pipeline before it is ever allowed near a live database connection. This document describes each layer of that pipeline honestly, including where the layers are genuinely strong, where they rely on best-effort heuristics, and what they cannot do by design.
+
+<Warning>
+This is a demo/portfolio project. It has not been through an independent security review (pen testing, threat modeling, or adversarial prompt-injection testing by anyone other than the author). Do not point it at a production database or any database containing real sensitive or personal data without your own risk assessment first.
+</Warning>
+
+## What Is Enforced
+
+<CardGroup cols={2}>
+  <Card title="AST-Based SQL Validation" icon="shield-check">
+    Every generated SQL string — including retries and any SQL you hand-edit in the UI before clicking **Confirm and Run** — is parsed with `sqlglot` and validated against an allowlist of read-only statement shapes. This is an allowlist on the parsed AST node type, not a regex or keyword blocklist.
+  </Card>
+  <Card title="Deep-Tree Write Detection" icon="tree">
+    Two additional AST-level checks close bypass classes a root-type-only check misses: a full-tree walk for embedded write/DDL operations, and a denylist of known-dangerous functions callable from inside an otherwise ordinary `SELECT`.
+  </Card>
+  <Card title="Read-Only Execution Layer" icon="lock">
+    Query execution goes through a read-only-by-convention SQLAlchemy engine, a row cap enforced two independent ways, and a wall-clock query timeout — three independent controls, any one of which can catch what another misses.
+  </Card>
+  <Card title="Secret Redaction & SecretStr" icon="eye-slash">
+    Driver error text is passed through `security/redaction.py` before it is ever logged or surfaced. `DB_PASSWORD` and `DB_CONNECTION_STRING` are wrapped in a `SecretStr` that redacts itself from `repr()` and `%r` output.
+  </Card>
+  <Card title="Input Guard" icon="filter">
+    Every typed question passes through `agent/input_guard.py` before anything else touches it: a character length cap, Unicode NFKC normalization plus an explicit confusables map for homoglyph substitution, and a regex pre-filter for common prompt-injection phrasings.
+  </Card>
+  <Card title="Column-Level Data Governance" icon="table-columns">
+    `config/sensitive_columns.yaml` lets you classify columns as `restricted`. A restricted column is never sampled into the schema prompt and any generated SQL that directly selects one is rejected with a retryable error so the model can drop it.
+  </Card>
+  <Card title="Identifier Quoting" icon="code">
+    `db/value_sampling.py` quotes table and column names via the engine's own dialect-aware `identifier_preparer` before building `SELECT DISTINCT` queries, closing a second-order SQL-injection path through maliciously-named identifiers.
+  </Card>
+  <Card title="Structured Audit Logging" icon="scroll">
+    Every rejection, validator safety violation, rate-limit trip, and RAG-poisoning-scan hit is logged as a structured event via `security/audit_log.py` on a dedicated `security.audit` logger — a single, consistently-shaped stream suitable for a SIEM pipeline.
+  </Card>
+</CardGroup>
+
+## SQL Validation in Detail
+
+The validator (`agent/sql_validator.py`) applies checks in the following order. The first failure short-circuits; the result type distinguishes security-gate failures (fail closed, never retry) from ordinary correctness mistakes (retryable):
+
+```python
+# Read-only root types — the allowlist
+_ALLOWED_ROOT_TYPES: tuple[type[exp.Expression], ...] = (
+    exp.Select,
+    exp.Union,
+    exp.Except,
+    exp.Intersect,
+)
+
+# Write/DDL checked anywhere in the parsed tree, not just at the root.
+# Closes the data-modifying CTE bypass:
+#   WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x
+#   — root is exp.Select but it deletes real rows.
+_DISALLOWED_NESTED_TYPES: tuple[type[exp.Expression], ...] = (
+    exp.Insert,
+    exp.Update,
+    exp.Delete,
+    exp.Merge,
+    exp.Drop,
+    exp.Create,
+    exp.Alter,
+    exp.TruncateTable,
+    exp.Command,  # sqlglot's fallback for unrecognised fragments
+)
+```
+
+<Note>
+The dangerous-function check is a **denylist**, not an allowlist. It can only be as complete as the enumerated list in `_DANGEROUS_FUNCTION_NAMES`. A database-engine-specific dangerous function not on that list is a real, standing residual risk. This is why it exists *underneath* the statement-type allowlist, not instead of it — the allowlist already blocks every non-`SELECT` statement shape regardless of what the denylist does or doesn't know.
+</Note>
+
+The denylist covers the following functions across all supported database engines:
+
+<Accordion title="PostgreSQL dangerous functions">
+  `pg_sleep`, `pg_read_file`, `pg_read_binary_file`, `pg_ls_dir`, `pg_stat_file` — DoS and local filesystem/directory disclosure. `lo_import`, `lo_export` — large-object file I/O. `dblink`, `dblink_connect`, `dblink_exec` — cross-database and network connections.
+</Accordion>
+
+<Accordion title="MySQL dangerous functions">
+  `sleep`, `benchmark` — timing-based DoS. `load_file` — local filesystem disclosure.
+</Accordion>
+
+<Accordion title="SQL Server (MSSQL) dangerous functions">
+  `openrowset`, `openquery`, `opendatasource` — remote/linked-server query execution (SSRF / lateral-pivot capable). `xp_cmdshell`, `xp_dirtree`, `xp_fileexist` — OS command execution and filesystem probing. `sp_configure`, `sp_oacreate` — server reconfiguration and OLE automation.
+</Accordion>
+
+<Accordion title="Oracle dangerous functions">
+  `utl_http`, `utl_tcp`, `utl_smtp` — SSRF and network egress. `utl_file` — filesystem I/O. `utl_inaddr` — DNS/hostname resolution (exfiltration-capable). `dbms_lock` — sleep-based DoS. `dbms_scheduler`, `dbms_java` — arbitrary job and code execution.
+</Accordion>
+
+## Execution-Layer Protections
+
+<Steps>
+  <Step title="Row cap enforced two independent ways">
+    `agent/sql_validator.py::enforce_row_limit` rewrites the SQL to add or clamp a `LIMIT`/`TOP` clause before execution. The database connection's own `MAX_RESULT_ROWS` setting (default 1,000) acts as a second, independent ceiling — neither alone is the only safeguard.
+  </Step>
+  <Step title="Wall-clock query timeout">
+    `QUERY_TIMEOUT_SECONDS` (default 15 s) is enforced at the SQLAlchemy execution layer. A query that exceeds this is cancelled and returned as an error, never left running.
+  </Step>
+  <Step title="Best-effort write-privilege check">
+    `db.connection.check_write_privileges` queries the connected database's own privilege catalog and **warns** (never blocks) if `DB_USER` appears to hold `INSERT`, `UPDATE`, or `DELETE` grants. Surfaced in the UI sidebar and `scripts/test_db_connection.py`. This is a canary, not a gate — the real guarantee is the database role itself.
+  </Step>
+  <Step title="Proactive cost estimation">
+    Before a validated query executes, its non-executing `EXPLAIN` / `SET SHOWPLAN_XML` plan is inspected for estimated row count. Queries estimated above `COST_HIGH_ROW_THRESHOLD` (default 1,000,000 rows) are rejected as retryable errors before they run. This check always **fails open** — any error or timeout in the estimation step lets the query proceed normally.
+  </Step>
+</Steps>
+
+## Secret Handling
+
+```python
+# From config/settings.py — db_password and db_connection_string are SecretStr.
+# repr() and %r output are always redacted; only .get_secret_value() yields the real value.
+db_password: SecretStr | None = None
+db_connection_string: SecretStr | None = None
+api_auth_token: SecretStr | None = None
+```
+
+`security/redaction.py` additionally strips passwords and connection strings from driver error text — some database drivers render the full attempted connection string, including the password, into their own failure messages. The `SecretStr` wrapper handles `repr()`/`%r` paths; `redaction.py` handles driver-generated error text paths. Neither alone is sufficient.
+
+<Note>
+`SecretStr` only redacts `repr()` and `%r` output. `str()` and f-string interpolation of the wrapped value still yield the real secret, because call sites that legitimately need the password (building the actual connection string) must still be able to get it. Secret redaction is a best-effort second layer, not a guarantee.
+</Note>
+
+## Input Guard and Database Content
+
+The input guard (`agent/input_guard.py`) applies Unicode NFKC normalization *plus* an explicit Cyrillic/Greek confusables map — plain NFKC alone does not defeat homoglyph substitution, a common misconception. It also applies a regex pre-filter for common prompt-injection phrasings and rejects inputs that exceed `MAX_QUESTION_LENGTH` (default 500 characters).
+
+Database-sourced content — table names, column names, and especially sampled distinct column values — is treated with the same suspicion as user input. Anyone who can write to the underlying database can write text that ends up inside an LLM prompt. Every sampled value is Unicode-normalized and control-character-stripped (`security/sanitization.py`) before being stored or rendered. The same injection-pattern regex used by the input guard is also applied to the fully-assembled retrieved schema context immediately before generation, in `agent.nodes.retrieve_schema_node` — detection only, never blocking.
+
+## Media Generation Approval
+
+When `ENABLE_MEDIA_GENERATION=true`, the `REQUIRE_GENERATION_APPROVAL` setting (default `true`) means the orchestrator only *proposes* what would be generated — no third-party API is called and no cost is incurred — until a human explicitly confirms via `POST /generate/confirm` or the **Generate** button in the dashboard. This mirrors the **Confirm and Run** gate for SQL execution, applied to the one source in the orchestrator that spends real money.
+
+```bash
+# In .env — secure by default
+REQUIRE_GENERATION_APPROVAL=true
+```
+
+Set to `false` only for a trusted automation context that has already reviewed this tradeoff.
+
+## Rate Limiting
+
+Two independent in-memory rate limits guard against resource exhaustion:
+
+| Limit | Default | Scope | Config key |
+|---|---|---|---|
+| Question submissions | 10 / min | Per client IP | `QUESTION_RATE_LIMIT_PER_MINUTE` |
+| LLM generation calls | 20 / min | Process-wide | `LLM_CALL_RATE_LIMIT_PER_MINUTE` |
+| API action calls | 20 / min | Per client IP | `API_ACTION_RATE_LIMIT_PER_MINUTE` |
+
+<Warning>
+Rate limiting is in-memory and single-process. It resets on every application restart. It is sized for one local user, not for multi-tenant or distributed deployments. It is not a substitute for real multi-tenant rate limiting backed by a distributed store with per-user identity.
+</Warning>
+
+## What Is NOT Guaranteed
+
+<Warning>
+The SQL validator does not physically prevent writes. There is no generic, cross-database way to strip write privileges at the SQLAlchemy layer. The real guarantee requires pointing `DB_USER` at a genuinely read-only database role. The app-level validator is one layer, not the only layer — a bug in it should not be your only line of defense.
+</Warning>
+
+The following are explicitly out of scope for the current security model:
+
+- **No per-user authentication or authorization.** `API_AUTH_TOKEN` is a single shared bearer token — a lightweight hook, not real auth. Anything reachable beyond a trusted local network needs a real authenticating reverse proxy regardless.
+- **Not hardened for multi-tenant production use.** The audit log gives every event a structured line a real deployment could ship to a SIEM, but it is application logging, not a tamper-evident audit trail with per-user identity.
+- **Prompt-injection defenses are layered, not a proof.** The regex patterns in `agent/input_guard.py` catch common phrasings — they are explicitly not the security boundary. What bounds the blast radius is structural: the system prompt's untrusted-data framing, the SQL validator's SELECT-only allowlist, and the read-only database connection underneath it.
+- **No independent security review.** This project has been reasoned about carefully, but "the author thought about it" is not the same as "someone tried to break it."
+
+## Reporting Vulnerabilities
+
+This is a personal project without a dedicated security contact. Please open a GitHub issue — or a private security advisory if enabled on the repository — describing the issue. For something that would let generated SQL bypass the read-only allowlist, or a question that gets past the system prompt's untrusted-data framing (not just the regex pre-filter — that is expected to be beatable), please include the exact input that triggered it.

@@ -1,0 +1,191 @@
+---
+title: "Deploying Text-to-SQL Agent with Docker Compose"
+sidebarTitle: "Deployment"
+description: "Run the Text-to-SQL Agent in a container: Docker Compose setup, Ollama and database connectivity, persistent Chroma volume, reverse proxy placement, and known production limitations."
+---
+
+The project ships a multi-stage `Dockerfile` and a `docker-compose.yml` that together produce a single `api` service. A Node.js stage builds the React dashboard into static files; a non-root Python stage serves both the FastAPI REST API and those static files from the same process on port `8000`. There is no separate web-server container, no bundled database, and no bundled Ollama server — both are deliberately external and user-provided, consistent with this project's "connect to your own database" design. Read `SECURITY.md` and `docs/PRODUCTION_CHECKLIST.md` before exposing this service beyond your own machine.
+
+<Warning>
+This project is **single-user and local-development oriented**. The in-memory rate limiter is per-process, API authentication is a single shared bearer token at most, and the Chroma index is an embedded persistent-directory rather than a scalable vector service. It is not hardened for multi-tenant production use. Treat it as a powerful internal tool or a proof of concept, and review `docs/PRODUCTION_READINESS_REPORT.md` before widening its exposure.
+</Warning>
+
+## What Is (and Isn't) Provided
+
+<CardGroup cols={2}>
+  <Card title="Provided" icon="circle-check">
+    - Multi-stage `Dockerfile` (digest-pinned base images)
+    - `docker-compose.yml` with one `api` service
+    - Named Chroma volume (`chroma_index`) surviving container recreates
+    - Built-in health check hitting `GET /health`
+    - React dashboard served from the same process as the API
+  </Card>
+  <Card title="Not Provided (by Design)" icon="circle-xmark">
+    - Ollama container — run your own, point `OLLAMA_HOST` at it
+    - Bundled target database — connect via `.env`
+    - Kubernetes manifests — a single Compose deployment is the right scale today
+    - Microsoft ODBC Driver 17/18 for SQL Server — add it as an image layer if needed
+    - Tesseract OCR binary — same pattern, optional layer for media search
+  </Card>
+</CardGroup>
+
+## Docker Compose Quick Start
+
+<Steps>
+  <Step title="Copy and edit the environment file">
+    ```bash
+    cp .env.example .env
+    ```
+
+    At minimum, set your database connection (`DB_TYPE`, `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`) and point `OLLAMA_HOST` at your Ollama server. See [Configuration](/guides/configuration) for the full variable reference. Never commit `.env` — it is `.gitignore`d by default.
+  </Step>
+
+  <Step title="Build the image">
+    ```bash
+    docker compose build
+    ```
+
+    The first build downloads Node 22 and Python 3.11 slim base images and installs all pinned dependencies. Subsequent builds reuse the dependency layer unless `requirements.txt` changes.
+  </Step>
+
+  <Step title="Start the service">
+    ```bash
+    docker compose up -d
+    ```
+
+    The container binds to `127.0.0.1:8000` by default (see the Reverse Proxy section below before changing this). The health check endpoint at `GET /health` performs live dependency checks against your database, Ollama, and the Chroma index.
+  </Step>
+
+  <Step title="Build the schema embeddings (one-time, and after schema changes)">
+    ```bash
+    docker compose exec api python scripts/build_embeddings.py
+    ```
+
+    This indexes your database schema into the Chroma vector store so the agent can retrieve relevant tables per question. The script is idempotent — it skips re-embedding if the schema fingerprint has not changed, so it is safe to run after every deployment. The index persists in the named `chroma_index` volume and survives container restarts and image rebuilds.
+  </Step>
+
+  <Step title="Verify">
+    ```
+    Dashboard: http://localhost:8000/
+    Health:    http://localhost:8000/health
+    ```
+
+    A healthy response from `/health` returns HTTP `200` with `"status": "ok"`. A degraded response (one or more dependencies unreachable) returns HTTP `503` with `"status": "degraded"` and per-dependency detail — this is the right signal to check before asking why the agent isn't working.
+  </Step>
+</Steps>
+
+<Note>
+`docker compose config` renders your `.env` values into its output — including secrets. Do not paste that output anywhere or run it in a shared terminal or CI log.
+</Note>
+
+## Connecting to Ollama on the Host
+
+The `docker-compose.yml` includes:
+
+```yaml
+extra_hosts:
+  - "host.docker.internal:host-gateway"
+```
+
+Set in `.env`:
+
+```env
+OLLAMA_HOST=http://host.docker.internal:11434
+```
+
+This resolves automatically on Docker Desktop (Windows and macOS). On Linux with Docker Engine 20.10 or later, `host-gateway` maps `host.docker.internal` to the host's gateway address. If your Ollama instance runs on a different host or a dedicated server, point `OLLAMA_HOST` at that address directly — no other change is needed.
+
+## Connecting to an External Database
+
+Use the same `.env` variables as local development: `DB_TYPE`, `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, or `DB_CONNECTION_STRING` as a full override. The container makes outbound connections to whichever host your `.env` names, identical to running locally.
+
+### SQL Server ODBC Driver Extension
+
+The base image installs `unixodbc-dev` (the build-time header pyodbc needs) but **not** Microsoft's ODBC Driver 17 or 18 for SQL Server, which lives in Microsoft's own apt repository and meaningfully increases image size. If your `DB_TYPE=mssql`, extend the base image:
+
+```dockerfile
+FROM text-to-sql-dashboard:latest
+USER root
+RUN curl -sSL -O https://packages.microsoft.com/config/debian/12/packages-microsoft-prod.deb \
+    && dpkg -i packages-microsoft-prod.deb \
+    && apt-get update \
+    && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 \
+    && rm -rf /var/lib/apt/lists/* packages-microsoft-prod.deb
+USER app
+```
+
+PostgreSQL, MySQL, and Oracle deployments do not need this layer and should not carry its extra weight.
+
+## Persistent Chroma Volume
+
+The `chroma_index` named volume is mounted at `/app/embeddings/.chroma` inside the container. It survives:
+
+- Container restarts (`docker compose restart`)
+- Container recreates (`docker compose up -d` after a config change)
+- Image rebuilds (`docker compose build && docker compose up -d`)
+
+It does **not** survive `docker compose down -v` or an explicit `docker volume rm chroma_index`, which are the only way to force a full re-index from scratch.
+
+After any real schema change, re-run the embeddings build:
+
+```bash
+docker compose exec api python scripts/build_embeddings.py
+```
+
+## Reverse Proxy and TLS
+
+The port binding in `docker-compose.yml` defaults to `127.0.0.1`:
+
+```yaml
+ports:
+  - "${API_BIND_HOST:-127.0.0.1}:8000:8000"
+```
+
+This means the service is reachable only from the host machine by default. Before widening this, place an authenticating reverse proxy (e.g. `oauth2-proxy`, Nginx with auth, or your platform's managed ingress layer) in front of the service. Point the proxy at `api:8000` and terminate TLS and authentication there — the API service needs no code changes to accommodate this. The optional `API_AUTH_TOKEN` environment variable can layer a shared-secret check underneath the proxy as defence in depth, but it should never be the only protection for anything beyond a single trusted caller.
+
+Set `API_BIND_HOST` in `.env` to `0.0.0.0` (or the specific interface your reverse proxy connects from) only once the proxy is actually in place.
+
+**Request size limits:** configure your reverse proxy to enforce an upload size limit appropriate for your deployment. The API itself enforces limits on individual endpoints (`VOICE_MAX_UPLOAD_MB`, `MAX_DOCUMENT_UPLOAD_MB`), but a proxy-level limit provides an earlier rejection for oversized requests before they reach the application.
+
+## Production Secrets
+
+`.env` is excluded from the Docker image via `.dockerignore` and from version control via `.gitignore`. Pass it to the container through one of:
+
+- `docker compose`'s `env_file` directive (as configured by default)
+- A secrets manager injecting environment variables at runtime
+- Your CI/CD orchestrator's native secret injection mechanism
+
+Never bake secrets into a custom image layer — they persist in image history even if a subsequent layer removes the file.
+
+## Health Check
+
+The `Dockerfile` and `docker-compose.yml` both declare a health check:
+
+```yaml
+healthcheck:
+  test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+  interval: 30s
+  timeout: 5s
+  start_period: 20s
+  retries: 3
+```
+
+`GET /health` checks the database connection, the Ollama endpoint, and the Chroma index — not just that the process is running. A `200 ok` response means all three are reachable. A `503 degraded` response includes per-dependency detail in the response body.
+
+## When to Re-run `build_embeddings.py`
+
+Re-run whenever:
+
+- The database schema changes (new tables, renamed or dropped columns, new schemas)
+- You add or remove a database from `DB_CONNECTIONS`
+- You change `EMBEDDING_MODEL_NAME` (incompatible embeddings — a full rebuild is required)
+- You change `SCHEMA_TOP_K` or `CHROMA_COLLECTION_NAME` (affects retrieval behaviour)
+
+The script is fast when nothing has changed — it computes a schema fingerprint and skips re-embedding unchanged tables.
+
+## Horizontal Scaling Considerations
+
+- **The `api` service is effectively stateless per request** — running multiple replicas behind a load balancer is safe for the request path.
+- **Rate limiting is per-process, not distributed.** `agent/rate_limit.py`'s in-memory `SlidingWindowRateLimiter` enforces limits independently per replica. Multiple replicas each enforce their own independent limit. If the rate limits need to hold across the whole deployment, put a shared store (Redis) behind the limiter before scaling out.
+- **The Chroma index is the one piece of real shared state.** All replicas must mount the same `chroma_index` volume, or move to Chroma's client-server mode or a hosted vector database for true multi-host deployment.
+- **Ollama is the real bottleneck.** P95 latency is approximately 80 seconds on a local 8B model (see [Evaluation](/guides/evaluation)). Scaling API replicas does not help if all replicas are waiting on the same single Ollama instance.

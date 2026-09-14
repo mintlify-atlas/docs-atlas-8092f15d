@@ -1,0 +1,103 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "Text-to-SQL Agent",
+  "projectDescription": "A self-correcting, schema-aware LangGraph agent that converts natural-language questions into validated, read-only SQL — powered by a local Ollama LLM, ChromaDB schema retrieval, and a FastAPI + React dashboard.",
+  "theme": "luma",
+  "primaryColor": "#2563EB",
+  "lightColor": "#DBEAFE",
+  "darkColor": "#1E3A8A",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "quickstart-docker"
+            ]
+          },
+          {
+            "group": "Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/agent-graph",
+              "concepts/schema-retrieval",
+              "concepts/multi-source"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/configuration",
+              "guides/deployment",
+              "guides/multi-source-setup",
+              "guides/voice-media",
+              "guides/evaluation"
+            ]
+          },
+          {
+            "group": "Security & Operations",
+            "pages": [
+              "security/overview",
+              "security/production-checklist",
+              "troubleshooting"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "api/overview",
+              "api/authentication"
+            ]
+          },
+          {
+            "group": "Endpoints",
+            "pages": [
+              "api/ask",
+              "api/execute",
+              "api/schema",
+              "api/feedback",
+              "api/voice",
+              "api/media",
+              "api/health"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Self-correcting 11-node LangGraph state machine with adaptive retry budgets",
+    "Schema-aware retrieval via ChromaDB with FK-adjacency bridge expansion",
+    "AST-based SQL validation (sqlglot) — SELECT-only allowlist, not keyword blocklist",
+    "Local LLM via Ollama — no cloud API keys required for SQL generation",
+    "Multi-database auto-routing across PostgreSQL, MySQL, SQL Server, and Oracle",
+    "Optional multi-source RAG: document/policy PDFs, live web search (Tavily), media generation, media search",
+    "Golden-dataset feedback loop — human-approved (question, SQL) pairs as few-shot examples",
+    "React dashboard with chart auto-pick, retry timeline, and schema browser",
+    "Voice mode — local faster-whisper STT and Piper TTS",
+    "Grounded insights verified against actual result data before display"
+  ],
+  "publicApiSurface": [
+    "POST /ask — run a natural-language question through the full agent graph",
+    "POST /execute — validate and execute a specific SQL string read-only",
+    "GET /health — reachability check for database, Ollama, and schema index",
+    "GET /schema/tables — live table/column schema listing",
+    "POST /schema/refresh — re-introspect and re-embed all database schemas",
+    "POST /feedback/golden-example — save a human-approved (question, SQL) pair",
+    "POST /generate/confirm — confirm and execute a media-generation proposal",
+    "POST /voice/transcribe — transcribe audio to text via local Whisper",
+    "POST /voice/synthesize — synthesize text to speech via local Piper",
+    "POST /search/media — direct media-library search",
+    "agent.graph.run_agent(question, ...) — Python entry point",
+    "agent.orchestrator.graph.run_orchestrated(question, ...) — multi-source Python entry point"
+  ]
+}

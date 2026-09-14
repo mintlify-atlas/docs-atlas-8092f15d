@@ -1,0 +1,157 @@
+---
+title: "Benchmark Methodology and Measured Accuracy Results"
+sidebarTitle: "Evaluation"
+description: "How the Text-to-SQL Agent is evaluated: 57-case benchmark, execution-accuracy methodology, latest measured results with per-difficulty breakdowns, and how to run it yourself."
+---
+
+Accuracy claims in this project are backed by a real, runnable benchmark — not feature-list language. This page describes the evaluation methodology, reports the latest measured results honestly (including the numbers that do not look good), explains what they mean, and shows how to reproduce or extend the benchmark. The evaluation source lives in `eval/`, with benchmark cases in `eval/benchmark/*.yaml`, metrics logic in `eval/metrics.py`, and evaluators in `eval/evaluators.py`.
+
+<Note>
+The headline `sql_execution_accuracy` (92.3%) and the `result_set_accuracy` (29.6%) measure fundamentally different things. A query can execute successfully and return entirely wrong data. The number that matters for a "chat with your database" use case is result-set accuracy, and that number is 29.6% on this dataset. Read the [accuracy gap section](#the-accuracy-gap) before drawing conclusions from the headline figure.
+</Note>
+
+## Methodology
+
+### Execution Accuracy, Not SQL Text Similarity
+
+The benchmark uses **execution-accuracy as its primary metric**, not SQL text similarity to a gold reference. The gold SQL (`expected_sql` or `alternative_sql` in each YAML case) is executed live against the real database; the agent's actual result set is compared against that gold result set. Comparison is type-tagged, tolerance-rounded, and row-order-agnostic unless the specific case tests `ORDER BY` behaviour.
+
+`exact_sql_match` is computed for diagnostic purposes but explicitly does not gate pass/fail. The evaluators' own module docstring states: "do not optimize for SQL string similarity alone." A 0% `exact_sql_match` (as measured) is expected and unremarkable — the model never produces textually-identical SQL to the gold reference, which is fine.
+
+### Benchmark Dataset
+
+The benchmark comprises **57 cases** across `eval/benchmark/*.yaml`, organised into five difficulty tiers and more than 20 category subtypes:
+
+| Difficulty | Cases | What these test |
+|---|---|---|
+| `easy` | 6 | Simple filtering, single-table queries, basic aggregations |
+| `medium` | 10 | Joins, date filtering, GROUP BY/HAVING, multi-condition filters |
+| `hard` | 8 | Window functions, nested queries, CTEs, multi-table analysis |
+| `real_world` | 16 | Business questions, follow-up conversations, ambiguous wording |
+| `adversarial` | 17 | Prompt injection, malicious SQL, schema manipulation, unauthorized data access |
+
+Category subtypes include: `joins`, `aggregation`, `date_filtering`, `group_by_having`, `window_functions`, `nested_queries`, `ctes`, `follow_up`, `simple_filtering`, `sorting`, `null_handling`, `cost_estimation`, `business_questions`, `ambiguous_wording`, `incomplete_questions`, `multi_table_analysis`, `prompt_injection`, `malicious_sql`, `schema_manipulation`, `unauthorized_data`.
+
+### Regression Detection
+
+A stored baseline (`eval/baselines/latest.json`) enables automated regression detection:
+
+```bash
+python scripts/run_benchmark.py --check-regression
+```
+
+This command exits non-zero if accuracy, schema retrieval, security rejection, or latency/cost regresses beyond configured tolerance (`eval/regression.py`). The current baseline is the `run_20260901T151533Z` run described below.
+
+## Latest Measured Results
+
+**Run ID:** `run_20260901T151533Z`  
+**Date:** 2026-09-01  
+**Model:** `llama3.1:8b`  
+**Database:** `AdventureWorksDW2025` (SQL Server)  
+**Cases:** 57
+
+Full artifacts: `eval/results/run_20260901T151533Z.json` (compact), `run_20260901T151533Z_full.json` (with generated SQL and result rows), `live_run_output.log` (519-line narrated log).
+
+### Headline Metrics
+
+| Metric | Value | What it means |
+|---|---|---|
+| `sql_execution_accuracy` | **92.3%** | The agent produced a query that executed without a driver error most of the time. |
+| `result_set_accuracy` | **29.6%** | The result set was actually correct roughly 3 times in 10. This is the gap that matters. |
+| `final_accuracy` | **35.0%** | Overall pass/fail signal combining execution success, result-set correctness, and security-classification expectations (`compute_overall_pass`). |
+| `exact_sql_match` | 0.0% | Diagnostic only. 0% means the model never produces textually-identical SQL to the gold reference — expected and not itself a concern. |
+| `schema_retrieval_recall` | 82.2% | The right tables were retrieved in the top-K results most of the time... |
+| `relevant_table_precision` | 25.0% | ...but many irrelevant tables came along too, mostly via FK-adjacency bridge expansion casting a wide net. |
+| `security_rejection_accuracy` | **100%** | Every one of the 17 adversarial cases was correctly rejected or handled. The one metric at ceiling. |
+| `average_latency_seconds` | 33.3s | Average wall-clock time per question on a local 8B model. |
+| `p95_latency_seconds` | 79.5s | 95th-percentile latency — a real interactive-use consideration, not just a benchmark artifact. |
+
+### Per-Difficulty Breakdown
+
+| Difficulty | Cases | Pass Rate | Avg Latency |
+|---|---|---|---|
+| adversarial | 17 | **100%** | 9.3s |
+| easy | 6 | 67% | 25.9s |
+| medium | 10 | 40% | 52.9s |
+| hard | 8 | 25% | 57.3s |
+| real_world | 16 | 25% | 37.2s |
+
+Adversarial cases are both the fastest and the most reliable — expected, because rejection happens before any LLM generation attempt for most of them. Real-world and hard questions — the ones that matter most for a "chat with your database" use case — pass a quarter of the time.
+
+### Per-Category Breakdown (Categories with ≥2 Cases)
+
+| Category | Cases | Pass Rate |
+|---|---|---|
+| `prompt_injection` | 9 | 100% |
+| `malicious_sql` | 4 | 100% |
+| `null_handling` | 2 | 100% |
+| `schema_manipulation` | 2 | 100% |
+| `simple_filtering` | 2 | 100% |
+| `unauthorized_data` | 2 | 100% |
+| `cost_estimation` | 2 | 100% |
+| `follow_up` | 10 | 40% |
+| `aggregation` | 2 | 50% |
+| `date_filtering` | 2 | 50% |
+| `joins` | 2 | 50% |
+| `sorting` | 2 | 50% |
+| `ambiguous_wording` | 2 | 0% |
+| `business_questions` | 2 | 0% |
+| `ctes` | 2 | 0% |
+| `group_by_having` | 2 | 0% |
+| `incomplete_questions` | 2 | 0% |
+| `multi_table_analysis` | 2 | 0% |
+| `nested_queries` | 2 | 0% |
+| `window_functions` | 1 | 0% |
+
+`window_function_correctness` and `ambiguous_question_handling_accuracy` both measured 0.0% as aggregate metrics — real, current weaknesses of `llama3.1:8b` on this dataset.
+
+## The Accuracy Gap
+
+<Warning>
+`sql_execution_accuracy` (92.3%) and `result_set_accuracy` (29.6%) are not the same metric, and they are not both "accuracy" in any useful sense. A query that executes without a driver error can still return entirely wrong data — wrong grouping, wrong date range, wrong joins, wrong aggregation logic. The execution metric measures whether the SQL was syntactically and structurally valid enough to run. The result-set metric measures whether it returned the right answer. The gap between 92.3% and 29.6% is real, large, and the most important thing to understand about this system's current accuracy.
+</Warning>
+
+This gap reflects several concrete weaknesses:
+
+- **Window functions:** 0% pass rate. The model does not reliably generate correct `OVER()` clauses on `AdventureWorksDW2025`.
+- **CTEs and nested queries:** 0% pass rate. Complex multi-step query structures are not reliably generated.
+- **GROUP BY/HAVING:** 0% pass rate. Correct GROUP BY with non-trivial HAVING conditions is unreliable.
+- **Schema retrieval precision:** 25.0%. The FK-adjacency bridge expansion in `embeddings/retriever.py` often retrieves irrelevant tables alongside the relevant ones, polluting the LLM's context.
+- **Deterministic retries:** The self-correction loop runs at `temperature=0.0`. When the retry prompt does not change the model's reasoning enough, a deterministic model reproduces its own mistake rather than exploring an alternative — observed empirically as byte-identical SQL across multiple retry attempts on the same question.
+
+## A Known Failure Mode
+
+A captured trace documented one question ("Show total sales by year and product name") retrying the full retry budget — 4 attempts — and generating **byte-identical SQL on attempts 2, 3, and 4** despite the error-feedback prompt changing each time. With `temperature=0.0` (deterministic generation), this is a real tension with the self-correction loop's premise: if a retry prompt does not change the model's reasoning enough, the model reproduces the same mistake rather than exploring an alternative. In this case, 3 of 4 retries were pure wasted latency and LLM-call budget.
+
+<Note>
+A separate, since-reproduced case of this pattern was traced to a specific root cause — a nested-aggregate shape (`AVG(CASE WHEN ... THEN SUM(x) ELSE 0 END)`) used for a year-over-year growth question. `agent/sql_validator.py` now catches this shape statically with a targeted rewrite hint, and `agent/complexity.py` widens the retry budget adaptively for questions matching non-trivial patterns. The query-planning and plan-conformance review pass adds a semantic check beyond raw driver error text. **None of these improvements have been re-benchmarked** against this document's measured numbers as of the benchmark run date.
+</Note>
+
+## Running the Benchmark
+
+```bash
+# Full 57-case run
+python scripts/run_benchmark.py
+
+# Partial run for faster iteration
+python scripts/run_benchmark.py --limit 20
+
+# Compare against the stored baseline (exits non-zero on regression)
+python scripts/run_benchmark.py --check-regression
+
+# Record this run as the new baseline
+python scripts/run_benchmark.py --save-baseline
+```
+
+Requirements: a live database connection and a running Ollama instance with the configured model pulled — the same requirements as the application itself. The benchmark is not part of the `pytest` suite or CI pipeline (`.github/workflows/ci.yml` documents why). See `CONTRIBUTING.md` for adding new benchmark cases.
+
+`python scripts/monitoring_summary.py` prints a compact summary of the current baseline for periodic review. Pass `--log-file` to also count security-event occurrences from a captured run log.
+
+## What Would Improve These Numbers
+
+None of the following was attempted in the current version (they would change AI-quality behaviour, outside the scope of the hardening and documentation pass that produced this benchmark):
+
+- **A larger or SQL-specialized model.** `sqlcoder`, `duckdb-nsql`, or a larger general model is the most direct lever. `README.md`'s own "Known limitations" section names this explicitly.
+- **Retry-prompt diversification.** A small temperature bump on retry attempts specifically, or explicit instruction to try a structurally different approach, would address the identical-retry failure mode.
+- **Tightening schema retrieval precision.** The FK-adjacency bridge expansion in `embeddings/retriever.py` is a known source of over-inclusion. The bridge budget and tie-breaking logic are documented in `docs/ARCHITECTURE.md`.
+- **Extending the benchmark dataset.** 57 cases with 2 cases per category is a thin coverage for many subtypes. More cases per category would give more reliable per-category pass rates and surface regressions that the current dataset misses.

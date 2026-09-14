@@ -1,0 +1,223 @@
+---
+title: "Complete Environment Variable Configuration Reference"
+sidebarTitle: "Configuration"
+description: "Every environment variable the Text-to-SQL Agent reads, grouped by concern—from Ollama and database connections to rate limits, cost estimation, voice mode, and media search."
+---
+
+All configuration is driven by environment variables read at startup by `config/settings.py`. Copy `.env.example` to `.env`, fill in your values, and start the application. Malformed values (not merely missing ones) cause a `ConfigurationError` at startup — you will know immediately if something is wrong. Missing values for required fields are only raised when the relevant subsystem first tries to use them, so a non-DB-connected feature like schema linting can still start even if `DB_HOST` is not yet set. The **`Settings` object is a process-wide cached singleton** (`@lru_cache`) — any change to `.env` requires a full process restart to take effect, including changes made through the Settings page in the UI.
+
+## Ollama (Local LLM)
+
+The agent uses a locally-running Ollama server for all SQL generation, insight, and planning calls. No cloud LLM API key is required.
+
+| Variable | Default | Description |
+|---|---|---|
+| `OLLAMA_HOST` | `http://localhost:11434` | Base URL of the Ollama server. Used by both the agent and the `/health` endpoint's dependency check. |
+| `OLLAMA_MODEL` | `llama3.1:8b` | Model tag for SQL generation and insight. Swap to `sqlcoder`, `duckdb-nsql`, or a larger general model to improve accuracy. |
+| `OLLAMA_REQUEST_TIMEOUT_SECONDS` | `300` | Per-request HTTP timeout for Ollama calls. Raise this if you see `httpx.ReadTimeout` or `ConnectTimeout` on slower hardware. |
+
+## Database Connection
+
+| Variable | Default | Description |
+|---|---|---|
+| `DB_TYPE` | *(required)* | Selects the SQLAlchemy driver and sqlglot dialect. Accepted values: `postgresql`, `mysql`, `mssql`, `oracle`. |
+| `DB_HOST` | *(required unless `DB_CONNECTION_STRING` is set)* | Hostname or IP address of the database server. |
+| `DB_PORT` | DB_TYPE default | TCP port. Defaults to the standard port for the chosen `DB_TYPE`. |
+| `DB_NAME` | *(required unless `DB_CONNECTION_STRING` is set)* | Database or catalog name to connect to. |
+| `DB_USER` | — | Login username for the database connection. |
+| `DB_PASSWORD` | — | Login password. Stored as `SecretStr` — never logged in plaintext by this application. |
+| `DB_SCHEMA` | *(database default)* | When set, restricts schema introspection and what the LLM sees to a single schema. Leave blank to use the connection's default. |
+| `DB_CONNECTION_STRING` | — | Full SQLAlchemy connection string. When set, all discrete `DB_TYPE`/`DB_HOST`/`DB_PORT`/`DB_NAME`/`DB_USER`/`DB_PASSWORD` fields are ignored entirely. Also `SecretStr`-wrapped. |
+| `DB_ODBC_DRIVER` | `ODBC Driver 17 for SQL Server` | Only relevant for `DB_TYPE=mssql`. Must match a driver installed on the host machine — verify with `odbcinst -j` on Linux/macOS or Windows ODBC Data Sources. |
+
+<Warning>
+Always use a **dedicated read-only database account** for `DB_USER`. The agent enforces read-only access at the application layer (SQL validation, `LIMIT`/`TOP` injection) and at the query-execution layer, but a read-only database login is the non-bypassable backstop. See `SECURITY.md` for the full rationale. Never use a DBA or admin account.
+</Warning>
+
+### Multiple Databases (Optional)
+
+<Note>
+Leave `DB_CONNECTIONS` unset for a single-database setup — the `DB_*` block above is used as-is, internally named `"default"`. When `DB_CONNECTIONS` is set, the agent **automatically routes** each question to the most semantically relevant database using `embeddings/retriever.py::select_database`. There is no manual database picker in the UI.
+</Note>
+
+| Variable | Default | Description |
+|---|---|---|
+| `DB_CONNECTIONS` | *(unset)* | Comma-separated list of logical connection names, e.g. `sales,hr`. When set, the per-name `DB_<NAME>_*` variables below are required for each name. |
+| `DB_<NAME>_TYPE` | — | Database type for this connection. Same values as `DB_TYPE`. `<NAME>` is the connection name uppercased with non-alphanumeric characters replaced by `_`. |
+| `DB_<NAME>_HOST` | — | Database host for this connection. |
+| `DB_<NAME>_PORT` | — | Database port for this connection. |
+| `DB_<NAME>_NAME` | — | Database/catalog name for this connection. |
+| `DB_<NAME>_USER` | — | Login username for this connection. |
+| `DB_<NAME>_PASSWORD` | — | Login password for this connection. `SecretStr`-wrapped. |
+| `DB_<NAME>_SCHEMA` | — | Schema restriction for this connection. Optional. |
+| `DB_<NAME>_CONNECTION_STRING` | — | Full connection string override for this connection. Optional. `SecretStr`-wrapped. |
+| `DB_<NAME>_ODBC_DRIVER` | — | ODBC driver override for this connection. Only for `mssql` type. |
+
+A worked two-database example from `.env.example`:
+
+```env
+DB_CONNECTIONS=sales,hr
+DB_SALES_TYPE=postgresql
+DB_SALES_HOST=sales-db.internal
+DB_SALES_PORT=5432
+DB_SALES_NAME=sales
+DB_SALES_USER=sales_reader
+DB_SALES_PASSWORD=...
+DB_HR_TYPE=mysql
+DB_HR_HOST=hr-db.internal
+DB_HR_PORT=3306
+DB_HR_NAME=hr
+DB_HR_USER=hr_reader
+DB_HR_PASSWORD=...
+```
+
+Each configured database gets its own Chroma collection and schema-index cache. Running `python scripts/build_embeddings.py` builds or refreshes all of them in a single pass.
+
+## ChromaDB (Schema Retrieval Index)
+
+ChromaDB stores vector embeddings of your database schema DDL so the agent can retrieve only the most relevant tables for each question.
+
+| Variable | Default | Description |
+|---|---|---|
+| `CHROMA_PERSIST_DIR` | `./embeddings/.chroma` | Directory where the Chroma index is persisted to disk. |
+| `CHROMA_COLLECTION_NAME` | `schema_ddl` | Name of the Chroma collection holding schema DDL embeddings. |
+| `EMBEDDING_MODEL_NAME` | `all-MiniLM-L6-v2` | Sentence-transformers model used for both schema DDL and question embedding. |
+| `SCHEMA_TOP_K` | `4` | Number of most-relevant tables retrieved per question. Increase for queries spanning many tables; decrease to reduce irrelevant context noise. |
+
+## Agent Limits
+
+These variables control the self-correction loop, query execution, and LLM token budgets.
+
+| Variable | Default | Description |
+|---|---|---|
+| `MAX_RETRIES` | `3` | Maximum self-correction retries in the LangGraph loop before returning a failure. |
+| `COMPLEX_QUERY_MAX_RETRY_BONUS` | `2` | Extra retries added on top of `MAX_RETRIES` for questions `agent/complexity.py` flags as non-trivial (top-N-per-group phrasing, year-over-year comparisons, multiple simultaneous metrics). Set to `0` to disable adaptive retry widening. |
+| `MAX_RESULT_ROWS` | `1000` | Hard row cap applied to every executed query. Enforced at two independent layers — see `SECURITY.md`. |
+| `QUERY_TIMEOUT_SECONDS` | `15` | Wall-clock timeout for query execution. |
+| `LLM_MAX_TOKENS` | `1024` | Maximum tokens the LLM may generate per SQL-generation call. |
+| `INSIGHT_MAX_TOKENS` | `120` | Maximum tokens for the post-query plain-English insight sentence. Kept small deliberately — this is one or two sentences, not a full report. |
+| `MAX_QUESTION_LENGTH` | `500` | Maximum character length of a submitted question. Exceeding this is rejected with a clear error message, not silently truncated (`agent/input_guard.py`). |
+
+## Agentic Query Planning
+
+For questions `agent/complexity.py` judges non-trivial, the agent can generate a structured query plan before writing SQL and then verify plan conformance after generation. An ordinary question triggers zero extra LLM calls regardless of whether this is enabled.
+
+| Variable | Default | Description |
+|---|---|---|
+| `ENABLE_QUERY_PLANNING` | `true` | Master switch for the planning and plan-review LLM calls (`agent/nodes.py::plan_query_node`, `review_sql_node`). Disabling this reverts all questions to the pre-planning behavior. |
+| `QUERY_PLAN_MAX_TOKENS` | `300` | Maximum tokens for the up-front query plan — a short JSON array of step strings. |
+| `SQL_REVIEW_MAX_TOKENS` | `200` | Maximum tokens for the plan-conformance verdict (`"PASS"` or a one-sentence `"FAIL: ..."`). |
+
+## Rate Limiting
+
+These are in-memory per-process safeguards, appropriate for local and single-user deployments. They are not a distributed or multi-tenant rate limiter.
+
+| Variable | Default | Description |
+|---|---|---|
+| `QUESTION_RATE_LIMIT_PER_MINUTE` | `10` | Maximum question submissions per minute, per client IP. |
+| `LLM_CALL_RATE_LIMIT_PER_MINUTE` | `20` | Maximum LLM generation calls per minute, process-wide. Stricter than the question limit because retries can multiply the number of LLM calls a single question produces. |
+| `API_ACTION_RATE_LIMIT_PER_MINUTE` | `20` | Maximum calls per minute, per client IP, to `POST /execute`, `POST /schema/refresh`, the mutating `/documents` routes, and `POST /generate/confirm`. |
+
+## Query Cost Estimation
+
+Before executing a validated query, the agent optionally runs a non-executing `EXPLAIN`/`SHOWPLAN` to estimate the number of rows a query will touch.
+
+| Variable | Default | Description |
+|---|---|---|
+| `COST_ESTIMATION_ENABLED` | `true` | Whether `db/query_cost.py` runs a plan-only estimate before execution. Always fails open — any error or timeout skips the check and proceeds. |
+| `COST_ESTIMATION_TIMEOUT_SECONDS` | `3` | Timeout for the plan-only estimate call itself. |
+| `COST_MODERATE_ROW_THRESHOLD` | `50000` | Estimated rows above which the query still runs but the UI shows a "this may take a moment" notice. |
+| `COST_HIGH_ROW_THRESHOLD` | `1000000` | Estimated rows above which the query is not run at all — treated as a retryable error fed back to the generation node. Must be strictly greater than `COST_MODERATE_ROW_THRESHOLD`. |
+
+## Logging
+
+| Variable | Default | Description |
+|---|---|---|
+| `LOG_LEVEL` | `INFO` | Root logging level. Accepts standard Python `logging` level names: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. |
+| `LOG_REDACTION_LEVEL` | `standard` | Controls how much result-set shape is included in logs. `standard` logs row/column counts and column names but never cell values. `strict` drops column names too, leaving only counts — useful when column names themselves may be sensitive. |
+
+## REST API
+
+| Variable | Default | Description |
+|---|---|---|
+| `API_AUTH_TOKEN` | *(unset)* | Optional shared bearer token. When set, required on every request to `/ask` and `/schema/tables` as `Authorization: Bearer <token>`. A lightweight hook — not a substitute for a real authenticating reverse proxy. See `docs/API.md`. |
+
+## Multi-Source Router (Optional)
+
+The multi-source router allows the agent to answer questions from document RAG, policy documents, web search, and media sources in addition to SQL databases. Everything in this section is **off by default**. For a full walkthrough, see [Multi-Source Setup](/guides/multi-source-setup).
+
+| Variable | Default | Description |
+|---|---|---|
+| `ENABLE_MULTI_SOURCE_ROUTER` | `false` | Routes questions through `agent.orchestrator.graph.run_orchestrated` instead of calling `agent.graph.run_agent` directly. Off means the orchestrator graph is never constructed — a pure pass-through to SQL. |
+
+### Document and Policy RAG
+
+| Variable | Default | Description |
+|---|---|---|
+| `RAG_STORE_CONNECTION_STRING` | *(unset)* | SQLAlchemy connection string for a dedicated **SQL Server 2025+/Azure SQL** database (requires native `VECTOR` column type). Never reuse a `DB_CONNECTIONS` business database. `SecretStr`-wrapped. Required for `ENABLE_DOCUMENT_RAG` and `ENABLE_POLICY_RAG`. |
+| `RAG_STORE_ODBC_DRIVER` | `ODBC Driver 17 for SQL Server` | ODBC driver for the RAG store connection. Same meaning as `DB_ODBC_DRIVER`. |
+| `ENABLE_DOCUMENT_RAG` | `false` | Makes the general "documents" collection available to the router. Requires `RAG_STORE_CONNECTION_STRING`. |
+| `ENABLE_POLICY_RAG` | `false` | Makes the "policies" collection (with sensitivity gating) available. Independent of `ENABLE_DOCUMENT_RAG`. |
+| `RAG_TOP_K` | `4` | Chunks retrieved per question, per collection. |
+| `RAG_MAX_RETRIES` | `2` | Query-rewrite retries in the agentic RAG subgraph before falling back to "insufficient information." |
+| `RAG_CHUNK_SIZE` | `1200` | Target chunk length in characters when splitting an ingested PDF. |
+| `RAG_CHUNK_OVERLAP` | `150` | Character overlap between consecutive chunks. |
+| `RAG_EMBEDDING_MODEL_NAME` | *(blank = reuse `EMBEDDING_MODEL_NAME`)* | Override the embedding model used for document/policy chunks. Only set this if documents genuinely need a different model than schema retrieval. |
+
+### Live Web Search
+
+| Variable | Default | Description |
+|---|---|---|
+| `ENABLE_WEB_SEARCH` | `false` | Makes the web search node available to the router. Requires `WEB_SEARCH_API_KEY`. |
+| `WEB_SEARCH_PROVIDER` | `tavily` | Search provider. Only `tavily` is implemented today (`search/web_search.py::SUPPORTED_SEARCH_PROVIDERS`). |
+| `WEB_SEARCH_API_KEY` | *(unset)* | API key for the configured provider. Get a Tavily key at [tavily.com](https://tavily.com). `SecretStr`-wrapped. |
+| `WEB_SEARCH_MAX_RESULTS` | `5` | Maximum results requested per search call. |
+| `WEB_SEARCH_ANSWER_MAX_TOKENS` | `1200` | Maximum tokens for the LLM call that synthesizes a web-search answer. Larger than a typical SQL answer budget because a good web answer synthesizes multiple sources with inline citations. |
+
+### Voice Mode
+
+| Variable | Default | Description |
+|---|---|---|
+| `ENABLE_VOICE_MODE` | `true` | Whether the mic button and voice settings appear in the React dashboard. Exposed via `GET /health`'s `voice_enabled` field. |
+| `STT_MODEL_SIZE` | `base` | `faster-whisper` model size. Options: `tiny`, `base`, `small`, `medium`, `large-v3`. Auto-downloaded from Hugging Face Hub on first use. |
+| `STT_DEVICE` | `cpu` | `cpu` or `cuda`. Only set `cuda` on a machine with a confirmed working CUDA and cuDNN setup — nothing in the Docker image assumes a GPU. |
+| `STT_VOCABULARY_MAX_CHARS` | `200` | Caps the schema-derived vocabulary hint fed to Whisper's `initial_prompt`. Short by design — a hint, not a full schema dump. |
+| `VOICE_MAX_UPLOAD_MB` | `10` | Maximum upload size for `POST /voice/transcribe`. |
+| `VOICE_MAX_DURATION_SECONDS` | `30` | Maximum recording duration, checked before transcription runs. |
+| `TTS_VOICE` | `en_US-lessac-medium` | Piper TTS voice name. Download once with `python scripts/download_voice_model.py`. |
+| `TTS_VOICE_MODEL_PATH` | *(unset)* | Override for the `.onnx`/`.onnx.json` file location, if not the default `voice/models/<TTS_VOICE>.onnx`. |
+
+### Media Generation
+
+| Variable | Default | Description |
+|---|---|---|
+| `ENABLE_MEDIA_GENERATION` | `false` | Makes the generation source available to the router. Requires `IMA_API_KEY`. Off by default — enabling this authorizes real, metered IMA Studio spend. |
+| `IMA_API_KEY` | *(unset)* | IMA Studio API key. Get one at [imastudio.com](https://imastudio.com). `SecretStr`-wrapped. |
+| `IMA_API_BASE_URL` | `https://api.imastudio.com` | IMA Studio API base URL. |
+| `MEDIA_GEN_RATE_LIMIT` | `5` | Maximum generation requests allowed per `MEDIA_GEN_RATE_WINDOW_SECONDS`. |
+| `MEDIA_GEN_RATE_WINDOW_SECONDS` | `60` | Rate-limit window in seconds for media generation calls. |
+| `MEDIA_GEN_VIDEO_DURATION_SECONDS` | *(unset)* | Overrides the video model's clip length. The current IMA video model (Seedance 2.0) only accepts integers from 4–15. Leave unset to use the model's own default. |
+| `REQUIRE_GENERATION_APPROVAL` | `true` | When true, generation requests return `status="pending_approval"` and nothing is charged until the user clicks "Generate" in the dashboard or calls `POST /generate/confirm`. Set to `false` only in trusted automation contexts. |
+| `SESSION_EXPENSIVE_SOURCE_LIMIT` | `10` | Maximum combined generation and web-search invocations per session within `SESSION_EXPENSIVE_SOURCE_WINDOW_SECONDS`. |
+| `SESSION_EXPENSIVE_SOURCE_WINDOW_SECONDS` | `3600` | Window in seconds for the per-session expensive-source ceiling. |
+
+### Media Search
+
+| Variable | Default | Description |
+|---|---|---|
+| `ENABLE_MEDIA_SEARCH` | `false` | Makes the media search source available to the router. Both this and `MEDIA_LIBRARY_PATH` must be set. Off by default — enabling pulls in `torch` and `opencv-python`. |
+| `MEDIA_LIBRARY_PATH` | *(unset)* | Root folder `scripts/build_media_index.py` walks to ingest images and videos. Required when `ENABLE_MEDIA_SEARCH=true`. |
+| `MEDIA_EMBEDDING_PROVIDER` | `local_clip` | Only `local_clip` (on-device via `sentence-transformers`) is implemented today. |
+| `MEDIA_CLIP_MODEL_NAME` | `clip-ViT-B-32` | CLIP checkpoint used to embed both images and query text. |
+| `MEDIA_VISION_MODEL` | *(unset)* | Ollama vision-capable model name (e.g. `llava`) for per-video-segment captioning. Pull once with `ollama pull llava`. Blank skips captioning — segments are still indexed via ASR transcript and OCR text. |
+| `MEDIA_MAX_FILE_MB` | `200` | Maximum size of a single file `media/ingest.py` will process. |
+| `MEDIA_SEARCH_TOP_K` | `5` | Maximum hits returned per query, across images and video segments combined. |
+| `MEDIA_SCENE_DETECT_THRESHOLD` | `27.0` | PySceneDetect `ContentDetector` sensitivity. Lower values detect more (subtler) scene changes. `27.0` is PySceneDetect's own documented default. |
+
+## Validation Behaviour
+
+A few rules worth knowing before troubleshooting startup errors:
+
+- **Missing vs. malformed are treated differently.** A missing `DB_HOST` is fine at import time but raises `ConfigurationError` the moment something tries to connect. A malformed value (e.g. `DB_PORT=notanumber`) raises immediately at `Settings` construction.
+- **Security-relevant values are validated for sanity, not just type.** `MAX_RETRIES`, `MAX_RESULT_ROWS`, both rate limits, both cost thresholds, and `RAG_TOP_K` must all be positive integers. `COST_MODERATE_ROW_THRESHOLD` must be strictly less than `COST_HIGH_ROW_THRESHOLD`. `LOG_REDACTION_LEVEL` must be exactly `standard` or `strict`. All of these are enforced in `Settings._validate_security_settings()`.
+- **Restart required for any `.env` change.** `Settings` is an `@lru_cache` singleton. Changing `.env` while the process is running has no effect until the process is restarted.

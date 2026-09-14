@@ -1,0 +1,100 @@
+---
+title: "System Architecture: Text-to-SQL Agent Overview"
+sidebarTitle: "Architecture"
+description: "How the React dashboard, REST API, LangGraph agent, ChromaDB schema retrieval, and multi-database router fit together into one cohesive pipeline."
+---
+
+The Text-to-SQL Agent is built around a single, explicit pipeline rather than a monolithic service or a free-form AI loop. Two interfaces — a React dashboard served directly by FastAPI and a standalone REST API — both call the same `agent.orchestrator.graph.run_orchestrated` entry point (which, when the multi-source router is off, is a zero-overhead pass-through to `agent.graph.run_agent`). Every architectural decision flows from one principle: the SQL generation path should be **inspectable, boundable, and safe**, not emergent.
+
+## Interfaces and entry point
+
+Both interfaces sit on top of the same application binary. The FastAPI application (`api/main.py`) mounts the React dashboard's compiled static files via `StaticFiles` on the root path and exposes the REST API on the same port. No logic is duplicated per interface — the dashboard's chat panel calls `POST /ask`, the REST API client calls `POST /ask`, and both receive identical `AskResponse` payloads. The single entry point is `agent.orchestrator.graph.run_orchestrated`; when `ENABLE_MULTI_SOURCE_ROUTER=false` (the default), that function immediately delegates to `agent.graph.run_agent` without constructing the orchestrator graph at all.
+
+```bash
+# Both of these reach the same agent.graph.run_agent entry point:
+# 1. The React dashboard (built and served by FastAPI at http://localhost:8000/)
+uvicorn api.main:app --host 0.0.0.0 --port 8000
+
+# 2. Direct REST call
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What were total sales last quarter?", "enable_insight": true}'
+```
+
+## Pipeline at a high level
+
+A question passes through six conceptually distinct stages before results are returned. Each stage is a named node in the LangGraph state machine — not an implicit step in a chain — so every transition and every retry path is visible in the graph definition.
+
+<Steps>
+  <Step title="Input sanitization">
+    `sanitize_input_node` applies a length cap, Unicode normalization (NFKC plus explicit confusables-folding), and a regex pre-filter for common prompt-injection phrasings. A rejection here ends the run immediately with a non-technical message — never the raw reason.
+  </Step>
+  <Step title="Schema retrieval">
+    `retrieve_schema_node` embeds the question, runs cosine-similarity search against the ChromaDB collection for the auto-selected database, then expands the result with FK-adjacency bridge tables that pure similarity search tends to miss. Table descriptions from `config/table_descriptions.yaml` are overlaid fresh from disk on every question.
+  </Step>
+  <Step title="SQL generation">
+    `generate_sql_node` calls the local Ollama LLM with the schema context, optional golden-example few-shot pairs, and (for complex questions) an ordered query plan. It checks a process-wide rate limiter before every attempt, including retries.
+  </Step>
+  <Step title="Validation">
+    `validate_sql_node` parses the generated SQL with `sqlglot` and checks it against an explicit allowlist (`SELECT`/`UNION`/`EXCEPT`/`INTERSECT` only). A safety violation fails closed immediately — no retry. A correctable parse error routes back to generation with the error as context.
+  </Step>
+  <Step title="Execution">
+    `execute_sql_node` runs the validated SQL on a read-only engine with a row cap (`MAX_RESULT_ROWS`, enforced both as a `LIMIT` clause and at the cursor) and a timeout enforced by closing the socket from a background thread. Execution failures are classified and routed: missing-reference errors re-enter schema retrieval; other errors retry generation; timeouts end immediately.
+  </Step>
+  <Step title="Insight generation">
+    `generate_insight_node` produces an optional plain-English sentence grounded against the actual result data. Any number in the insight must be traceable to the result set — an unsupported claim is silently dropped, never shown.
+  </Step>
+</Steps>
+
+## Component overview
+
+<CardGroup cols={2}>
+  <Card title="FastAPI layer (api/)" icon="server">
+    Serves the React dashboard as compiled static files and exposes REST endpoints (`/ask`, `/execute`, `/schema`, `/feedback`, `/documents`, `/voice`, `/media`, `/generate`, `/search`). Acts as a thin wrapper — no agent logic lives here.
+  </Card>
+  <Card title="LangGraph agent (agent/)" icon="diagram-project">
+    An 11-node explicit `StateGraph` compiled once per process. Every node function takes `AgentState` and returns a partial dict of updates. Retry routing, safety gates, and rate limiting are all named edges in the graph — not emergent behavior.
+  </Card>
+  <Card title="ChromaDB embeddings (embeddings/)" icon="database">
+    One Chroma collection per configured database, keyed by `db_name`. Schema DDL is embedded with `all-MiniLM-L6-v2` (default). A separate per-database collection stores golden examples. The `retriever.py::select_database` function auto-routes each question to the most schema-relevant database.
+  </Card>
+  <Card title="Database layer (db/)" icon="table">
+    Handles schema introspection (`db/schema_introspection.py`), read-only engine construction, value sampling for low-cardinality string columns, query cost estimation (`EXPLAIN`/`SHOWPLAN`), and read-only SQL execution with timeout enforcement. Fully config-driven — no hardcoded connection strings.
+  </Card>
+  <Card title="Optional RAG / voice / media (rag/, api/voice.py, api/media.py)" icon="puzzle-piece">
+    Document and policy RAG (SQL Server 2025+ `VECTOR` columns), local voice transcription and synthesis (faster-whisper, Piper), media generation (IMA Studio, behind explicit human approval), and content-based media search (local CLIP embeddings). All off by default; the SQL pipeline is identical with or without any of them.
+  </Card>
+  <Card title="Configuration (config/settings.py, .env)" icon="gear">
+    All runtime knobs live in `.env` and are exposed via a Pydantic `Settings` singleton (`config/settings.py`). Database connections, Ollama model, embedding model, retry budgets, feature flags, and rate limits are all `.env` variables — none are hardcoded.
+  </Card>
+</CardGroup>
+
+## Why a state machine rather than free-form ReAct
+
+The agent is a small, explicit `StateGraph`, not a free-form ReAct-style agent. That design choice is intentional: every possible transition is a named edge in the graph, so the retry and error-feedback path is something you can read off `agent/graph.py::build_graph()` directly — not something that emerges from the model's own planning.
+
+Concretely, this means:
+
+- **Safety gates are hard edges.** A SQL safety violation routes to `END (failed)` unconditionally — no model reasoning can override it.
+- **Retry budgets are bounded.** `state["max_retries"]` is computed once per question and read by every retry-vs-give-up check. A complex question earns a slightly wider budget (via `agent.complexity.compute_max_retries`), but the ceiling is always explicit.
+- **Failures are classified, not generic.** A `MISSING_REFERENCE` execution error re-enters schema retrieval with a widened `top_k`. A `TIMEOUT` never retries. A plan-conformance failure feeds the reviewer's critique back into generation — each failure category has a specific, reasoned routing.
+- **The full retry timeline is observable.** `attempt_history` accumulates one `AttemptRecord` per attempt (with `outcome`, `will_retry`, and the raw error) so the dashboard can render a complete timeline rather than only the latest attempt.
+
+## Multi-database auto-routing
+
+When more than one database is configured via `DB_CONNECTIONS`, `embeddings.retriever.select_database` runs before schema retrieval on every question. It embeds the question and finds which database's collection produces the highest-similarity result. The selected database is stored in `state["selected_database"]` and **never re-selected** mid-run — a retry on a missing-reference error reuses the same database rather than silently rerouting to a different one.
+
+A single-database setup short-circuits this entirely — no embedding comparison, no extra latency.
+
+## Supported databases
+
+<Note>
+All four drivers are configured purely through `DB_TYPE` (single database) or `DB_CONNECTIONS` (multi-database) in `.env`. No code changes are needed to switch database engines. Source of truth: `db/connection.py::SUPPORTED_DB_TYPES`.
+</Note>
+
+| `DB_TYPE` | Driver | Notes |
+|---|---|---|
+| `postgresql` | `psycopg2-binary` | Fully supported including cost estimation via `EXPLAIN`. |
+| `mysql` | `pymysql` | Fully supported including cost estimation via `EXPLAIN`. |
+| `mssql` | `pyodbc` | Requires the Microsoft ODBC Driver for SQL Server installed as a system package. Cost estimation via `SHOWPLAN_XML`. |
+| `oracle` | `oracledb` (thin mode) | No separate Oracle Client install required. |

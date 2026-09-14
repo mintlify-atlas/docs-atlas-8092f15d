@@ -1,0 +1,176 @@
+---
+title: "API Authentication: Bearer Token Configuration Guide"
+sidebarTitle: "Authentication"
+description: "Configure the optional shared bearer token for the Text-to-SQL API, understand which endpoints require it, and learn the production limitations of this lightweight auth hook."
+---
+
+The Text-to-SQL Agent API ships with authentication **disabled by default**. Out of the box, every endpoint is reachable without any credentials — consistent with the project's local-first, single-user design. When you need at least a basic access gate (for example, when the API is reachable from more than just localhost), you can enable a shared bearer-token check by setting `API_AUTH_TOKEN` in your `.env` file. The logic lives in `api/auth.py` and is deliberately simple: one secret, one constant-time check, no session state.
+
+## How It Works
+
+When `API_AUTH_TOKEN` is unset (the default), the `verify_api_key` dependency imported by protected routes is a **no-op** — it reads the setting, finds nothing, and returns immediately. Every request is allowed through.
+
+When `API_AUTH_TOKEN` is set, every request to a protected endpoint must include the token as a Bearer credential in the `Authorization` header. The comparison uses `hmac.compare_digest` rather than a plain `==` to avoid leaking how many leading characters matched via response-timing differences:
+
+```python
+# api/auth.py
+def _is_matching_bearer_token(authorization_header: str, expected_token: str) -> bool:
+    if not authorization_header.startswith(_BEARER_PREFIX):
+        return False
+    provided = authorization_header[len(_BEARER_PREFIX):]
+    # Constant-time comparison to prevent timing side-channel token guessing.
+    return hmac.compare_digest(provided, expected_token)
+```
+
+A missing or non-matching header returns `HTTP 401` with a `WWW-Authenticate: Bearer` challenge header.
+
+## Setting the Token
+
+Add `API_AUTH_TOKEN` to your `.env` file:
+
+```bash
+# .env
+API_AUTH_TOKEN=your-secret-token
+```
+
+Use a long, random value — a UUID or a 32-byte hex string is appropriate:
+
+```bash
+# Generate a suitable value (macOS/Linux):
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+Restart the server after changing `.env`. `config/settings.py` wraps `API_AUTH_TOKEN` in a `SecretStr` — it is never logged in plaintext, and its `repr()` output is always redacted in tracebacks and debug output.
+
+## Which Endpoints Require Authentication
+
+When `API_AUTH_TOKEN` is set, the following endpoints require a valid `Authorization: Bearer <token>` header via `Depends(verify_api_key)` in `api/main.py`:
+
+| Endpoint | Method | Auth Required |
+|---|---|:---:|
+| `/ask` | `POST` | ✅ When set |
+| `/execute` | `POST` | ✅ When set |
+| `/schema/tables` | `GET` | ✅ When set |
+| `/schema/refresh` | `POST` | ✅ When set |
+| `/feedback/golden-example` | `POST` | ✅ When set |
+| `/generate/confirm` | `POST` | ✅ When set |
+| `/health` | `GET` | ❌ Never |
+| `/voice/transcribe` | `POST` | ❌ Never |
+| `/voice/synthesize` | `POST` | ❌ Never |
+| `/search/media` | `POST` | ❌ Never |
+
+`GET /health` is intentionally unauthenticated so that container orchestrators and load balancers can reach it without needing to be issued a credential. It is also a metadata-only endpoint — it tells you whether the database, Ollama, and ChromaDB are reachable, but it never returns schema data or query results.
+
+<Info>
+The voice and media-search endpoints are not protected by `verify_api_key` in the current implementation. If you need to gate them, place the API behind an authenticating reverse proxy (see the Deployment guide) rather than relying solely on `API_AUTH_TOKEN`.
+</Info>
+
+## Sending the Token
+
+Include the token in the `Authorization` header on every request to a protected endpoint:
+
+```http
+Authorization: Bearer your-secret-token
+```
+
+### cURL Examples
+
+<CodeGroup>
+
+```bash With Authentication
+# POST /ask with a bearer token
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-secret-token" \
+  -d '{
+    "question": "What were total internet sales in 2012?",
+    "enable_insight": true
+  }'
+```
+
+```bash Without Authentication (API_AUTH_TOKEN unset)
+# POST /ask — no token needed when API_AUTH_TOKEN is not configured
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "What were total internet sales in 2012?",
+    "enable_insight": true
+  }'
+```
+
+```bash Health Check (always unauthenticated)
+# GET /health never requires a token — safe for use in readiness probes
+curl http://localhost:8000/health
+```
+
+```bash Schema Tables with Token
+# GET /schema/tables — requires token when API_AUTH_TOKEN is set
+curl http://localhost:8000/schema/tables \
+  -H "Authorization: Bearer your-secret-token"
+```
+
+</CodeGroup>
+
+## Error Responses
+
+A missing or invalid token returns `HTTP 401`:
+
+```json
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer
+Content-Type: application/json
+
+{
+  "detail": "Missing or invalid Authorization header."
+}
+```
+
+The response body is identical whether the header was absent entirely or the token value was wrong — the server does not distinguish between the two cases to avoid confirming whether a token exists at all.
+
+## Known Limitations
+
+<Warning>
+`API_AUTH_TOKEN` is a **lightweight shared secret, not a real authentication system**. It exists so the API is not completely open the moment it is reachable from more than localhost — not as a substitute for proper authentication. Before using this in any non-local context, understand what it does and does not provide:
+
+- **One shared token, not per-user identity.** Every caller uses the same credential. There is no login flow, no token issuance, no session management, no per-user data isolation, and no authorization model beyond "has the token or doesn't."
+- **No rotation mechanism.** Changing `API_AUTH_TOKEN` requires editing `.env` and restarting the server. There is no concept of token expiry, revocation, or rotation without a full server restart.
+- **No OAuth, no OIDC, no RBAC.** If you need to distinguish between users, restrict access to specific endpoints per identity, or integrate with an SSO provider, this token cannot do that.
+- **Evadable by IP spoofing.** Rate limiting keys on client IP address. The token check itself is per-request and constant-time, but it provides no defense against a caller who simply shares the token.
+
+**For anything beyond local or fully trusted-network use, place this API behind a real authenticating reverse proxy** — for example, `oauth2-proxy`, your platform's managed auth layer, or an API gateway — regardless of whether `API_AUTH_TOKEN` is set. See `docs/DEPLOYMENT.md` for reverse-proxy configuration guidance and `SECURITY.md` for the full security posture of this project.
+</Warning>
+
+## Implementation Reference
+
+The complete authentication implementation is in `api/auth.py`:
+
+```python
+# api/auth.py — abridged
+def verify_api_key(authorization: str | None = Header(default=None)) -> None:
+    """FastAPI dependency: 401s if API_AUTH_TOKEN is set and the request's
+    Authorization header doesn't present it as a matching bearer token.
+
+    A no-op when API_AUTH_TOKEN is unset (the default).
+    """
+    settings = get_settings()
+    if settings.api_auth_token is None:
+        return
+    expected = settings.api_auth_token.get_secret_value()
+    if authorization is None or not _is_matching_bearer_token(authorization, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid Authorization header.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+```
+
+The dependency is attached to each protected route via FastAPI's `Depends` mechanism:
+
+```python
+# api/main.py — example protected route
+@app.post("/ask", response_model=AskResponse, dependencies=[Depends(verify_api_key)])
+def ask(payload: AskRequest, request: Request) -> AskResponse:
+    ...
+```
+
+Routes that must remain unauthenticated — `GET /health` — simply omit `Depends(verify_api_key)` from their decorator.
