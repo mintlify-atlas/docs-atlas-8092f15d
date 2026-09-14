@@ -57,6 +57,7 @@ Before investigating any problem, check `GET /health`. It tests Ollama reachabil
   | `host_unreachable` | TCP connection failed entirely. | Check `DB_HOST`, `DB_PORT`, VPN, and firewall rules. |
   | `database_not_found` | Auth succeeded but the named database doesn't exist. | Check `DB_NAME` for a typo. |
   | `timeout` | Connection attempt itself timed out. | Check network latency to the host. |
+  | `unknown` | Does not match any of the above known patterns. | Read the driver error text included alongside the category — it is never hidden, only classified. |
 
   <Note>
   Classification is best-effort keyword matching on the underlying driver's own error text. It is not authoritative — the full original error message is always included in the output alongside the category.
@@ -86,6 +87,12 @@ Before investigating any problem, check `GET /health`. It tests Ollama reachabil
   ```
 
   **In Docker**, the base image does not include the ODBC driver layer. You must add it to your `Dockerfile` — see `docs/DEPLOYMENT.md`'s mssql section for the exact image layer to add.
+</Accordion>
+
+<Accordion title="SAWarning: Unrecognized server version info">
+  **Symptom:** A `SAWarning: Unrecognized server version info` appears in the terminal on startup or connection.
+
+  This is harmless. SQLAlchemy's dialect has a known list of server versions for feature-detection purposes — a newer database engine version than the driver ships metadata for triggers this warning but does not prevent connecting or querying. Safe to ignore; update the driver package if it is bothersome.
 </Accordion>
 
 <Accordion title="Write-privilege warning from test_db_connection.py">
@@ -225,6 +232,28 @@ Before investigating any problem, check `GET /health`. It tests Ollama reachabil
   </Note>
 </Accordion>
 
+<Accordion title="Voice mode: 413 or 'recording exceeds limit' error">
+  **Symptom:** The upload is rejected with a `413` response or a "recording exceeds limit" message.
+
+  Either `VOICE_MAX_UPLOAD_MB` (default 10 MB) or `VOICE_MAX_DURATION_SECONDS` (default 30 s) was exceeded. Ask a shorter question, or raise the relevant limit in `.env` and restart the server:
+
+  ```bash
+  # In .env
+  VOICE_MAX_UPLOAD_MB=20
+  VOICE_MAX_DURATION_SECONDS=60
+  ```
+</Accordion>
+
+<Accordion title="Voice mode: schema-specific terms (table or column names) are transcribed inaccurately">
+  **Symptom:** Common words are transcribed correctly but database-specific names (table names, column names) are mis-heard as similar-sounding words.
+
+  `voice/stt.py` automatically biases Whisper toward your actual schema vocabulary via `_build_vocabulary_hint` — this injects table and column names from every configured database as an `initial_prompt`. This step fails open (silently does nothing) if schema introspection itself errors. A persistent mismatch is more likely a genuinely unusual or ambiguous term than a broken feature — rebuild the schema index first to make sure the vocabulary hint is current:
+
+  ```bash
+  python scripts/build_embeddings.py
+  ```
+</Accordion>
+
 ## Docker Issues
 
 <Accordion title="Container cannot connect to host-side Ollama">
@@ -266,6 +295,121 @@ Before investigating any problem, check `GET /health`. It tests Ollama reachabil
   **Symptom:** Any `docker` or `docker compose` command fails immediately with "cannot connect to the Docker daemon."
 
   Docker Desktop (on macOS or Windows) or the Docker Engine service (on Linux) is not running. Start it before retrying any Docker command.
+</Accordion>
+
+## Quality Gate Failures
+
+<Accordion title="ruff check . fails">
+  Usually an unused import or an unsorted import block. Auto-fix most issues with:
+
+  ```bash
+  ruff check --fix .
+  ```
+
+  Review the diff before trusting it blindly — `--fix` is safe for import-ordering issues but may require manual review for more complex cases.
+</Accordion>
+
+<Accordion title="black --check . fails">
+  Run `black .` to auto-format. It never needs manual intervention:
+
+  ```bash
+  black .
+  ```
+</Accordion>
+
+<Accordion title="mypy . fails">
+  Read the actual error before reaching for `# type: ignore` — a surprising number of real bugs surface this way. This project's own production-readiness audit found several: a loop variable silently reused across two different-typed loops, a dict-vs-dataclass access mismatch, and a `sqlglot.find_all()` call passed a tuple where variadic args were expected. Reserve `# type: ignore[<code>]` with a one-line comment for genuine typeshed or stub limitations, not as a first response to an error you have not read.
+</Accordion>
+
+<Accordion title="pytest fails after a .env change">
+  Most tests build their own `Settings(...)` explicitly and never read your real `.env` — a failure after an unrelated `.env` edit usually means something else changed. Tests that do need a live DB or Ollama are excluded from `pytest` by design (`scripts/integration_test.py`, `scripts/run_benchmark.py` — see `CONTRIBUTING.md`).
+</Accordion>
+
+## Known Bugs and Edge Cases
+
+<Accordion title="API process crashes on a query with a date column">
+  A real, observed segfault: `pandas==2.2.3` predates real Python 3.14 wheels and crashes (`Windows fatal exception: access violation` deep in `pandas.core.arrays.datetimes._construct_from_dt64_naive`) building a `DataFrame` from any row data containing a raw `datetime.datetime` value — that is, any query result with a date or datetime column. This kills the whole API process (not a catchable Python exception), which is what the browser shows as a failed or dropped `/execute` request.
+
+  **Fixed** by pinning `pandas==2.3.3` in `requirements.txt`. If you see this crash shape after touching dependency pins, check that pin has not regressed. Reproduces in two lines with no app code involved:
+
+  ```python
+  import datetime, pandas as pd
+  pd.DataFrame([(1, datetime.datetime(1990, 1, 1))], columns=["id", "d"])
+  ```
+</Accordion>
+
+<Accordion title="'Invalid object name X' for a table that genuinely exists">
+  Happens on a database whose tables live under a **non-default schema** — `DB_SCHEMA` (or `DB_<NAME>_SCHEMA` for a named connection) set to something other than `dbo` or `public`. The engine resolves an unqualified table name against the connecting user's own default schema, not the schema you configured for introspection. The model correctly generates `FROM Employee` (schema-qualification was never part of the DDL it was shown), but bare `Employee` fails to resolve if the connection's default schema is `dbo` and the table is really `employee.Employee`.
+
+  **Fixed** by `agent.sql_validator.qualify_table_schema`, applied transparently at execution time using `DB_SCHEMA`. If you still see this, confirm the configured schema name actually matches where the tables live:
+
+  ```sql
+  -- SQL Server
+  SELECT SCHEMA_NAME(schema_id), name FROM sys.tables;
+  -- PostgreSQL
+  SELECT schemaname, tablename FROM pg_tables WHERE schemaname NOT IN ('pg_catalog', 'information_schema');
+  ```
+</Accordion>
+
+## Multi-Source Router Issues
+
+<Accordion title="Router picked the wrong source, or a configured source is not offered">
+  Almost always either a missed app restart after a `.env` change (`Settings` is a cached singleton — restart the server after any change) or a genuinely ambiguous or compound question.
+
+  Check the `[router] available=[...] sources=[...] reasoning=...` log line before assuming something is broken. The available sources list tells you which sources the router actually sees as configured and enabled — if a source you expect is missing, verify both its feature flag (`ENABLE_WEB_SEARCH`, `ENABLE_DOCUMENT_RAG`, etc.) and its required credentials or paths are set, then restart.
+
+  See `guides/multi-source-setup` for the full setup requirements per source.
+</Accordion>
+
+## Media Generation Issues
+
+<Accordion title="A generation request never fires, or IMA API errors appear">
+  Confirm both `ENABLE_MEDIA_GENERATION=true` and a real `IMA_API_KEY` are set — an enabled flag with no key is not "available" to the router. Video generation shares its code path with image generation but has not been separately confirmed against a live IMA account; if only video fails, that is the most likely reason.
+
+  ```bash
+  # In .env
+  ENABLE_MEDIA_GENERATION=true
+  IMA_API_KEY=your_key_here
+  ```
+</Accordion>
+
+<Accordion title="Nothing happens after asking to generate something">
+  By design — `REQUIRE_GENERATION_APPROVAL=true` (the default) means the router only proposes what would be generated. You must click **"▶ Generate image"** or **"▶ Generate video"** (or call `POST /generate/confirm`) before anything is actually created or charged. Check for that confirmation button in the response before assuming the request failed.
+</Accordion>
+
+<Accordion title="MEDIA_GEN_VIDEO_DURATION_SECONDS has no effect or is rejected by the provider">
+  The underlying video model has its own hard duration ceiling (commonly 4–15 seconds for current IMA models). This setting can request a shorter clip within that range but cannot exceed what the model itself supports — an out-of-range value is rejected by the provider, not pre-validated by this app.
+</Accordion>
+
+## Media Search Issues
+
+<Accordion title="Media search says the feature is disabled">
+  Both `ENABLE_MEDIA_SEARCH=true` and a real, existing `MEDIA_LIBRARY_PATH` are required. Check both in `.env` and restart the server.
+</Accordion>
+
+<Accordion title="A file in the library never turns up in search results">
+  Nothing is searchable until it has been indexed. Run `scripts/build_media_index.py` after adding files, with `--force` to re-index files that already have an unchanged content hash on record:
+
+  ```bash
+  python scripts/build_media_index.py --force
+  ```
+</Accordion>
+
+<Accordion title="On-screen text in a video frame is never matched by search">
+  OCR requires the system Tesseract binary installed separately (not pip-installable). A missing binary fails open — the segment is still indexed via transcript and caption text alone — so this looks like reduced recall rather than an error. Install Tesseract from your OS package manager to enable OCR.
+</Accordion>
+
+## Input Guard Rejections
+
+<Accordion title="'I couldn't process that question' — legitimate question rejected">
+  By design, rejection messages are deliberately generic rather than naming exactly which pattern or rule matched — see `security/overview` for the reasoning (a rejection must not confirm to an attacker exactly what was detected).
+
+  If you believe a legitimate question was rejected incorrectly, check the terminal or application logs for `agent.input_guard` log lines — the actual reason code is logged there even though the user-facing message is generic. The `security.audit` logger also captures every rejection as a structured event.
+
+  Common causes:
+  - Question exceeds `MAX_QUESTION_LENGTH` (default 500 characters) — rephrase more concisely.
+  - Question matches a prompt-injection regex pattern — rephrase to avoid phrasing that looks like an instruction (e.g. "ignore previous instructions").
+  - Input contains Unicode homoglyphs — the input guard normalises Cyrillic/Greek confusables; if the question came via copy-paste from an external source, try retyping it.
 </Accordion>
 
 ## Diagnosing Unknown Issues

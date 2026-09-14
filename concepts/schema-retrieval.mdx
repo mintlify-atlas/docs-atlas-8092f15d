@@ -10,7 +10,7 @@ Dumping an entire production schema into the prompt burns context window and inc
 
 Every question passes through this sequence inside `agent.nodes.retrieve_schema_node`:
 
-```
+```text
 introspect_schema()            -- live SQLAlchemy Inspector, metadata only
         |
 value_sampling.attach_sample_values()  -- real DISTINCT values for

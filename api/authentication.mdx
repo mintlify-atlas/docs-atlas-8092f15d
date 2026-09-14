@@ -1,7 +1,7 @@
 ---
 title: "API Authentication: Bearer Token Configuration Guide"
 sidebarTitle: "Authentication"
-description: "Configure the optional shared bearer token for the Text-to-SQL API, understand which endpoints require it, and learn the production limitations of this lightweight auth hook."
+description: "Configure the optional shared bearer token, understand which endpoints require auth, and learn the production limitations of this lightweight hook."
 ---
 
 The Text-to-SQL Agent API ships with authentication **disabled by default**. Out of the box, every endpoint is reachable without any credentials — consistent with the project's local-first, single-user design. When you need at least a basic access gate (for example, when the API is reachable from more than just localhost), you can enable a shared bearer-token check by setting `API_AUTH_TOKEN` in your `.env` file. The logic lives in `api/auth.py` and is deliberately simple: one secret, one constant-time check, no session state.
@@ -54,15 +54,17 @@ When `API_AUTH_TOKEN` is set, the following endpoints require a valid `Authoriza
 | `/schema/refresh` | `POST` | ✅ When set |
 | `/feedback/golden-example` | `POST` | ✅ When set |
 | `/generate/confirm` | `POST` | ✅ When set |
+| `/voice/transcribe` | `POST` | ✅ When set |
+| `/voice/synthesize` | `POST` | ✅ When set |
+| `/search/media` | `POST` | ✅ When set |
+| `/media/{media_id}` | `GET` | ✅ When set |
+| `/media/library/{media_id}` | `GET` | ✅ When set |
 | `/health` | `GET` | ❌ Never |
-| `/voice/transcribe` | `POST` | ❌ Never |
-| `/voice/synthesize` | `POST` | ❌ Never |
-| `/search/media` | `POST` | ❌ Never |
 
 `GET /health` is intentionally unauthenticated so that container orchestrators and load balancers can reach it without needing to be issued a credential. It is also a metadata-only endpoint — it tells you whether the database, Ollama, and ChromaDB are reachable, but it never returns schema data or query results.
 
 <Info>
-The voice and media-search endpoints are not protected by `verify_api_key` in the current implementation. If you need to gate them, place the API behind an authenticating reverse proxy (see the Deployment guide) rather than relying solely on `API_AUTH_TOKEN`.
+All endpoints except `GET /health` are protected by `verify_api_key` when `API_AUTH_TOKEN` is set — including `/voice/transcribe`, `/voice/synthesize`, `/search/media`, `/media/{media_id}`, and `/media/library/{media_id}`. For anything beyond local or trusted-network use, place the API behind a real authenticating reverse proxy in addition to setting `API_AUTH_TOKEN`.
 </Info>
 
 ## Sending the Token

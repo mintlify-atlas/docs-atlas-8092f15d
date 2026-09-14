@@ -1,7 +1,7 @@
 ---
-title: "Text-to-SQL Agent REST API: Service Overview"
+title: "Text-to-SQL Agent REST API: Overview and Endpoints"
 sidebarTitle: "Overview"
-description: "Explore the FastAPI REST service that exposes the LangGraph agent — base URL, all available endpoints, safety guarantees, rate limiting, and correlation ID tracing."
+description: "FastAPI REST service exposing the LangGraph agent — base URL, all endpoints, safety guarantees, rate limiting, and correlation ID tracing."
 ---
 
 The Text-to-SQL Agent ships a single FastAPI process (`api/main.py`) that is both the REST API and, once the React frontend is built, the server that delivers the dashboard itself. There is no separate backend for programmatic access — calling `POST /ask` from a script and clicking **Ask** in the UI both resolve to the same `run_orchestrated()` call inside the agent graph. That means every safety control documented in the security overview applies identically to the API: the input guard, the AST-based SQL validator, the row cap, the query timeout, the rate limiter, and the sensitive-column blocking layer are shared code, not a parallel implementation that could drift.
@@ -49,11 +49,11 @@ In production, a full build of the React frontend (`npm run build` inside `front
     **POST /generate/confirm** — Human-approval step for media generation; only meaningful when `ENABLE_MULTI_SOURCE_ROUTER` and `ENABLE_MEDIA_GENERATION` are both on.
   </Card>
   <Card title="Voice & Media" icon="microphone">
-    **POST /voice/transcribe** — Transcribe a recorded audio question to text using local `faster-whisper`; requires `ENABLE_VOICE_MODE`.
+    **POST /voice/transcribe** — Transcribe a recorded audio question to text using local `faster-whisper`; requires `ENABLE_VOICE_MODE`. Auth required when `API_AUTH_TOKEN` is set.
 
-    **POST /voice/synthesize** — Synthesize text to speech via local Piper; returns raw `audio/wav` bytes.
+    **POST /voice/synthesize** — Synthesize text to speech via local Piper; returns raw `audio/wav` bytes. Auth required when `API_AUTH_TOKEN` is set.
 
-    **POST /search/media** — Direct media-library search; requires `ENABLE_MEDIA_SEARCH`.
+    **POST /search/media** — Direct media-library search; requires `ENABLE_MEDIA_SEARCH`. Auth required when `API_AUTH_TOKEN` is set.
   </Card>
 </CardGroup>
 
@@ -70,12 +70,12 @@ All endpoints return `application/json` unless noted otherwise. Authentication r
 | `POST` | `/schema/refresh` | When set | JSON | Re-introspect and re-embed all configured database schemas. |
 | `POST` | `/feedback/golden-example` | When set | JSON | Save a human-approved (question, SQL) pair for few-shot retrieval. |
 | `POST` | `/generate/confirm` | When set | JSON | Confirm and trigger a proposed media generation. |
-| `POST` | `/voice/transcribe` | No | JSON | Transcribe an audio upload to text (multipart/form-data). |
-| `POST` | `/voice/synthesize` | No | `audio/wav` | Synthesize text to speech; returns raw WAV bytes. |
-| `POST` | `/search/media` | No | JSON | Search the media library by natural-language query. |
+| `POST` | `/voice/transcribe` | When set | JSON | Transcribe an audio upload to text (multipart/form-data). |
+| `POST` | `/voice/synthesize` | When set | `audio/wav` | Synthesize text to speech; returns raw WAV bytes. |
+| `POST` | `/search/media` | When set | JSON | Search the media library by natural-language query. |
 
 <Note>
-`POST /voice/synthesize` is the only endpoint that does **not** return `application/json`. It streams raw `audio/wav` bytes directly. Handle it accordingly in clients that assume a JSON body.
+Not all endpoints return `application/json`. `POST /voice/synthesize` returns raw `audio/wav` bytes, and `GET /media/{media_id}` / `GET /media/library/{media_id}` return raw media bytes (image or video). Handle these accordingly in clients that assume a JSON body.
 </Note>
 
 ## Safety Guarantees

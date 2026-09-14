@@ -1,5 +1,5 @@
 ---
-title: "POST /feedback — Save a Golden SQL Example"
+title: "POST /feedback/golden-example — Save an Approved SQL"
 sidebarTitle: "POST /feedback"
 description: "Persist a human-approved (question, SQL) pair to ChromaDB for future few-shot retrieval, improving generation accuracy on semantically similar questions."
 ---
@@ -60,7 +60,7 @@ Requests missing or mismatching the token receive `401 Unauthorized`.
 ## Response Fields
 
 <ResponseField name="saved" type="boolean" required>
-  `true` when the pair was successfully embedded and written to ChromaDB. `false` when the write failed (e.g. ChromaDB unreachable) — the API returns HTTP `200` in both cases; callers should surface a warning to the user when `saved` is `false` so they can retry.
+  `true` when the pair was successfully embedded and written to ChromaDB. The current implementation always returns `true` — storage failures are logged and swallowed server-side (so a UI feedback click never appears to fail) and are visible only in the server logs. Check `GET /health` if you suspect ChromaDB is unreachable.
 </ResponseField>
 
 ## Example Request
@@ -84,17 +84,9 @@ curl -X POST http://localhost:8000/feedback/golden-example \
 }
 ```
 
-## Example: Failed Save
-
-```json
-{
-  "saved": false
-}
-```
-
-<Warning>
-When `saved` is `false`, the pair was **not** stored. This typically means ChromaDB was unreachable at the time of the request. Verify ChromaDB's health via `GET /health` (`schema_index.ok` in the response) and retry the request. Failed saves are logged with their correlation ID — check the audit log if the problem persists.
-</Warning>
+<Note>
+Storage failures in `save_golden_example` are swallowed server-side and logged as warnings — the endpoint always returns HTTP `200`. If you suspect a golden example was not saved (for example, after a ChromaDB connectivity issue), verify the index health via `GET /health` (check each database entry's `schema_index.ok`) and check the server logs for `WARNING: Failed to save golden example`.
+</Note>
 
 ## Tuning Retrieval Sensitivity
 

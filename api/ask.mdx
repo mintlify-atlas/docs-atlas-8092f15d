@@ -1,10 +1,10 @@
 ---
-title: "POST /ask — Run a Natural-Language SQL Question"
+title: "POST /ask — Run a Natural-Language SQL Query Agent"
 sidebarTitle: "POST /ask"
 description: "Run a natural-language question through the full agent graph: schema retrieval, SQL generation, self-correction, and read-only execution with insight."
 ---
 
-The `/ask` endpoint is the heart of the Text-to-SQL agent. A single POST carries your question through the entire pipeline: input guard, ChromaDB schema retrieval, optional query planning for complex questions, SQL generation, plan-conformance review, validation, cost estimation, read-only execution, self-correction on failure, and a plain-English insight sentence. Every safety layer — the SELECT-only validator, the row cap, query timeout, sensitive-column blocking, and the LLM-call rate limiter — applies unconditionally because this endpoint is a direct pass-through to `agent.graph.run_agent`; there is no secondary code path that could drift from those rules.
+The `/ask` endpoint is the heart of the Text-to-SQL agent. A single POST carries your question through the entire pipeline: input guard, ChromaDB schema retrieval, optional query planning for complex questions, SQL generation, plan-conformance review, validation, cost estimation, read-only execution, self-correction on failure, and a plain-English insight sentence. Every safety layer — the SELECT-only validator, the row cap, query timeout, sensitive-column blocking, and the LLM-call rate limiter — applies unconditionally because this endpoint calls `agent.orchestrator.graph.run_orchestrated` directly (which is itself a thin pass-through to `agent.graph.run_agent` unless `ENABLE_MULTI_SOURCE_ROUTER` is set); there is no secondary code path that could drift from those rules.
 
 <Note>
 The API is **stateless**. There is no server-side session. If you need follow-up question resolution (e.g., "how about last year?"), you must resend recent turns in `conversation_history` on every request. The React dashboard reconstructs this automatically from its own `chatStore`; programmatic callers must do the same.
@@ -132,6 +132,10 @@ A per-client-IP question limiter enforces `QUESTION_RATE_LIMIT_PER_MINUTE` (defa
 
 <ResponseField name="rejection_message" type="string | null">
   Human-readable explanation of the rejection, safe to display to end users.
+</ResponseField>
+
+<ResponseField name="rate_limit_message" type="string | null">
+  When `status` is `"rate_limited"`, a human-readable message explaining that the per-session LLM-call budget was exhausted. `null` in all other cases.
 </ResponseField>
 
 <ResponseField name="clarification_message" type="string | null">

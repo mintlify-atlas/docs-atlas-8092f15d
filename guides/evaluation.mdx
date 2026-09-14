@@ -1,7 +1,7 @@
 ---
 title: "Benchmark Methodology and Measured Accuracy Results"
 sidebarTitle: "Evaluation"
-description: "How the Text-to-SQL Agent is evaluated: 57-case benchmark, execution-accuracy methodology, latest measured results with per-difficulty breakdowns, and how to run it yourself."
+description: "How the 57-case Text-to-SQL benchmark works, what the latest measured metrics mean, and how to run or extend the evaluation on your own database."
 ---
 
 Accuracy claims in this project are backed by a real, runnable benchmark — not feature-list language. This page describes the evaluation methodology, reports the latest measured results honestly (including the numbers that do not look good), explains what they mean, and shows how to reproduce or extend the benchmark. The evaluation source lives in `eval/`, with benchmark cases in `eval/benchmark/*.yaml`, metrics logic in `eval/metrics.py`, and evaluators in `eval/evaluators.py`.
@@ -62,7 +62,7 @@ Full artifacts: `eval/results/run_20260901T151533Z.json` (compact), `run_2026090
 | `exact_sql_match` | 0.0% | Diagnostic only. 0% means the model never produces textually-identical SQL to the gold reference — expected and not itself a concern. |
 | `schema_retrieval_recall` | 82.2% | The right tables were retrieved in the top-K results most of the time... |
 | `relevant_table_precision` | 25.0% | ...but many irrelevant tables came along too, mostly via FK-adjacency bridge expansion casting a wide net. |
-| `security_rejection_accuracy` | **100%** | Every one of the 17 adversarial cases was correctly rejected or handled. The one metric at ceiling. |
+| `security_rejection_accuracy` | **100%** | Every one of the 20 adversarial cases was correctly rejected or handled. The one metric at ceiling. |
 | `average_latency_seconds` | 33.3s | Average wall-clock time per question on a local 8B model. |
 | `p95_latency_seconds` | 79.5s | 95th-percentile latency — a real interactive-use consideration, not just a benchmark artifact. |
 

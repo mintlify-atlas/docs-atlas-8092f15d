@@ -1,7 +1,7 @@
 ---
 title: "Complete Environment Variable Configuration Reference"
 sidebarTitle: "Configuration"
-description: "Every environment variable the Text-to-SQL Agent reads, grouped by concern—from Ollama and database connections to rate limits, cost estimation, voice mode, and media search."
+description: "Reference for every .env variable the Text-to-SQL Agent reads: Ollama, database, ChromaDB, rate limits, cost estimation, voice mode, and media settings."
 ---
 
 All configuration is driven by environment variables read at startup by `config/settings.py`. Copy `.env.example` to `.env`, fill in your values, and start the application. Malformed values (not merely missing ones) cause a `ConfigurationError` at startup — you will know immediately if something is wrong. Missing values for required fields are only raised when the relevant subsystem first tries to use them, so a non-DB-connected feature like schema linting can still start even if `DB_HOST` is not yet set. The **`Settings` object is a process-wide cached singleton** (`@lru_cache`) — any change to `.env` requires a full process restart to take effect, including changes made through the Settings page in the UI.
@@ -98,6 +98,16 @@ These variables control the self-correction loop, query execution, and LLM token
 | `INSIGHT_MAX_TOKENS` | `120` | Maximum tokens for the post-query plain-English insight sentence. Kept small deliberately — this is one or two sentences, not a full report. |
 | `MAX_QUESTION_LENGTH` | `500` | Maximum character length of a submitted question. Exceeding this is rejected with a clear error message, not silently truncated (`agent/input_guard.py`). |
 
+## Golden-Dataset Feedback Loop
+
+When a user confirms a correct result in the UI, that `(question, SQL)` pair is saved to a per-database ChromaDB collection. Future similar questions retrieve the best-matching saved examples and inject them as few-shot prompts into generation. This is a safe no-op until at least one example has been saved — an empty collection simply returns nothing.
+
+| Variable | Default | Description |
+|---|---|---|
+| `ENABLE_GOLDEN_EXAMPLES` | `true` | Whether `agent/nodes.py::retrieve_golden_examples_node` retrieves saved human-approved examples and injects them into the generation prompt. Safe to leave on even with an empty dataset. |
+| `GOLDEN_EXAMPLES_TOP_K` | `3` | Maximum saved examples retrieved per question (before similarity filtering below). |
+| `GOLDEN_EXAMPLES_MIN_SIMILARITY` | `0.75` | Minimum cosine similarity (0.0–1.0) a saved example must clear to actually be injected. A poor match is withheld entirely — a misleading example is worse than no example at all. |
+
 ## Agentic Query Planning
 
 For questions `agent/complexity.py` judges non-trivial, the agent can generate a structured query plan before writing SQL and then verify plan conformance after generation. An ordinary question triggers zero extra LLM calls regardless of whether this is enabled.
@@ -140,7 +150,9 @@ Before executing a validated query, the agent optionally runs a non-executing `E
 
 | Variable | Default | Description |
 |---|---|---|
-| `API_AUTH_TOKEN` | *(unset)* | Optional shared bearer token. When set, required on every request to `/ask` and `/schema/tables` as `Authorization: Bearer <token>`. A lightweight hook — not a substitute for a real authenticating reverse proxy. See `docs/API.md`. |
+| `API_AUTH_TOKEN` | *(unset)* | Optional shared bearer token. When set, required on every `api/` request as `Authorization: Bearer <token>`. A lightweight hook — not a substitute for a real authenticating reverse proxy. See `docs/API.md`. |
+| `CORS_ALLOWED_ORIGINS` | *(unset)* | Comma-separated list of origins allowed to call this API cross-origin (e.g. `http://localhost:5173` for a React dev server). Empty by default — a same-origin deployment needs no CORS at all. |
+| `API_BIND_HOST` | `127.0.0.1` | **Docker Compose only** — controls the host-side interface the port binding uses (`${API_BIND_HOST:-127.0.0.1}:8000:8000`). Not read by the Python app itself. Only widen to `0.0.0.0` once a real authenticating reverse proxy is in front. |
 
 ## Multi-Source Router (Optional)
 
@@ -163,6 +175,8 @@ The multi-source router allows the agent to answer questions from document RAG, 
 | `RAG_CHUNK_SIZE` | `1200` | Target chunk length in characters when splitting an ingested PDF. |
 | `RAG_CHUNK_OVERLAP` | `150` | Character overlap between consecutive chunks. |
 | `RAG_EMBEDDING_MODEL_NAME` | *(blank = reuse `EMBEDDING_MODEL_NAME`)* | Override the embedding model used for document/policy chunks. Only set this if documents genuinely need a different model than schema retrieval. |
+| `ENABLE_PDF_DOWNLOAD` | `true` | Whether uploaded PDFs have their raw bytes stored alongside extracted chunks so they can be downloaded later from a citation link or the Knowledge Sources page. True by default — a real storage-growth cost unlike the compute-only flags. Turn off if persistent storage of raw PDFs matters for your deployment. |
+| `MAX_DOCUMENT_UPLOAD_MB` | `25` | Maximum upload size (in MB) for one `POST /documents` request. Enforced by reading at most this many bytes regardless of what the request claims. |
 
 ### Live Web Search
 
@@ -205,8 +219,8 @@ The multi-source router allows the agent to answer questions from document RAG, 
 
 | Variable | Default | Description |
 |---|---|---|
-| `ENABLE_MEDIA_SEARCH` | `false` | Makes the media search source available to the router. Both this and `MEDIA_LIBRARY_PATH` must be set. Off by default — enabling pulls in `torch` and `opencv-python`. |
-| `MEDIA_LIBRARY_PATH` | *(unset)* | Root folder `scripts/build_media_index.py` walks to ingest images and videos. Required when `ENABLE_MEDIA_SEARCH=true`. |
+| `ENABLE_MEDIA_SEARCH` | `true` | Makes the media search source available to the router. Both this and a real `MEDIA_LIBRARY_PATH` must be set for the source to actually be offered — an enabled flag with no configured folder is treated as unavailable. On by default; turn off for deployments that do not need media search, since enabling it pulls in `torch` and `opencv-python`. |
+| `MEDIA_LIBRARY_PATH` | `./media_library` | Root folder `scripts/build_media_index.py` walks to ingest images and videos. Required when `ENABLE_MEDIA_SEARCH=true`. |
 | `MEDIA_EMBEDDING_PROVIDER` | `local_clip` | Only `local_clip` (on-device via `sentence-transformers`) is implemented today. |
 | `MEDIA_CLIP_MODEL_NAME` | `clip-ViT-B-32` | CLIP checkpoint used to embed both images and query text. |
 | `MEDIA_VISION_MODEL` | *(unset)* | Ollama vision-capable model name (e.g. `llava`) for per-video-segment captioning. Pull once with `ollama pull llava`. Blank skips captioning — segments are still indexed via ASR transcript and OCR text. |

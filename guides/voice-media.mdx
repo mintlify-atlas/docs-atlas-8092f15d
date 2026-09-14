@@ -1,10 +1,10 @@
 ---
 title: "Voice Input, TTS, Media Generation, and Media Search"
 sidebarTitle: "Voice & Media"
-description: "Configure local speech-to-text and text-to-speech for hands-free querying, IMA Studio image and video generation, and CLIP-powered local media library search."
+description: "Configure local STT and TTS for hands-free querying, IMA Studio image and video generation, and CLIP-powered local media library search."
 ---
 
-Beyond text queries and SQL databases, the Text-to-SQL Agent supports three optional media-adjacent capabilities: voice mode (local STT and TTS, on by default), media generation (AI image and video creation via IMA Studio, off by default), and media search (CLIP-based semantic search over a local image and video library, off by default). Each feature is independently controlled by a feature flag and can be combined with any other configuration. This page covers what each feature does, how to enable and configure it, and the important caveats worth knowing before turning it on.
+Beyond text queries and SQL databases, the Text-to-SQL Agent supports three optional media-adjacent capabilities: voice mode (local STT and TTS, on by default), media generation (AI image and video creation via IMA Studio, off by default), and media search (CLIP-based semantic search over a local image and video library, flag on by default but requires a configured `MEDIA_LIBRARY_PATH` to become active). Each feature is independently controlled by a feature flag and can be combined with any other configuration. This page covers what each feature does, how to enable and configure it, and the important caveats worth knowing before turning it on.
 
 <Tabs>
   <Tab title="Voice Mode">
@@ -132,10 +132,10 @@ Beyond text queries and SQL databases, the Text-to-SQL Agent supports three opti
   <Tab title="Media Search">
     Media search indexes a local image and video library and lets the agent answer questions like "find the photo of the site inspection" or "do we have a video of the ribbon-cutting ceremony." All embedding runs locally using CLIP via `sentence-transformers` — no API key and no data sent externally.
 
-    Media search is **off by default** because it pulls in `torch`, `opencv-python`, and `scenedetect` — a meaningfully larger dependency footprint than any other optional feature in this project.
+    `ENABLE_MEDIA_SEARCH` is **`true` by default**, but the source only becomes available when both the flag is on **and** a real `MEDIA_LIBRARY_PATH` folder is configured — an enabled flag with no folder is treated as unavailable. Turn the flag off for deployments that do not need media search, since it pulls in `torch`, `opencv-python`, and `scenedetect` — a meaningfully larger dependency footprint than any other optional feature in this project.
 
     <Warning>
-    Enabling `ENABLE_MEDIA_SEARCH=true` significantly increases image size and memory usage due to `torch` and `opencv-python`. Measure the impact before deploying. Tesseract OCR is also **not included in the base Docker image** — on-screen text in video frames will not be indexed unless you add it as an image layer (see [Deployment](/guides/deployment)).
+    Running media search with a real `MEDIA_LIBRARY_PATH` significantly increases image size and memory usage due to `torch` and `opencv-python`. Measure the impact before deploying. Tesseract OCR is also **not included in the base Docker image** — on-screen text in video frames will not be indexed unless you add it as an image layer (see [Deployment](/guides/deployment)).
     </Warning>
 
     ### Enabling Media Search
@@ -183,7 +183,7 @@ Beyond text queries and SQL databases, the Text-to-SQL Agent supports three opti
 
     | Variable | Default | Description |
     |---|---|---|
-    | `MEDIA_LIBRARY_PATH` | *(unset)* | Root folder for `scripts/build_media_index.py` to walk. |
+    | `MEDIA_LIBRARY_PATH` | `./media_library` | Root folder for `scripts/build_media_index.py` to walk. Required along with `ENABLE_MEDIA_SEARCH=true` before the source is offered. |
     | `MEDIA_EMBEDDING_PROVIDER` | `local_clip` | Only `local_clip` (on-device CLIP) is implemented today. |
     | `MEDIA_CLIP_MODEL_NAME` | `clip-ViT-B-32` | CLIP checkpoint for embedding images and query text. |
     | `MEDIA_VISION_MODEL` | *(unset)* | Ollama vision model for video segment captioning. Pull with `ollama pull llava`. Blank skips captioning. |

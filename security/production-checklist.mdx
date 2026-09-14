@@ -82,6 +82,43 @@ These items represent real safety or data boundaries, not best-practice suggesti
   </Step>
 </Steps>
 
+## Strongly Recommended Before Real Users Touch It
+
+These items are not hard blockers, but skipping any of them before real users interact with the agent is a decision you should make consciously, not by accident.
+
+- [ ] **Run the full quality gate and confirm it is clean:** `pytest`, `ruff check .`, `black --check .`, `mypy .` — all four, not a subset. All four were red at the start of this project's own 2026-09-01 audit; verify your working tree, not this document's claim about a past state.
+
+  ```bash
+  pytest
+  ruff check .
+  black --check .
+  mypy .
+  ```
+
+- [ ] **Run the benchmark and read the actual numbers** — do not assume the last recorded baseline still reflects your model, database, and prompt combination:
+
+  ```bash
+  python scripts/run_benchmark.py --check-regression
+  ```
+
+  See `guides/evaluation` for how to interpret the output. A 35% final-accuracy baseline is the documented starting point, not a target to feel good about matching.
+
+- [ ] **Explicitly decide what accuracy bar is acceptable for your use case**, and do not deploy past it silently. This project does not set that bar for you — it only measures and reports it honestly.
+
+- [ ] **Verify Ollama capacity matches expected concurrent load.** The reference benchmark run measured `p95_latency_seconds` ≈ 80 s. A single local Ollama instance serialises requests; scaling app or API replicas alone does not fix this.
+
+- [ ] **Health checks are wired into your deployment platform's own monitoring** — `GET /health` actually verifies DB, Ollama, and Chroma reachability. Point real alerting at it; do not rely on the container staying in a `running` state.
+
+- [ ] **`docs/monitoring_summary.py` (or your own equivalent) has somewhere to run periodically.** It is a script today, not a scheduled job; scheduling it is a per-deployment decision this project does not make for you.
+
+## Worth Doing — Not Blocking
+
+- [ ] Pin the `Dockerfile` base image to a specific digest for a stricter reproducibility guarantee than a floating tag provides.
+- [ ] Verify the pinned dependency versions (chosen for this project's dev machine's Python 3.14, per `requirements.txt`'s own comment) against whatever Python version your deployment actually runs — CI runs 3.11 and passes, which is reassuring but not the same as an explicit driver-by-driver check.
+- [ ] If you extend this for `DB_TYPE=mssql` in Docker, confirm the Microsoft ODBC driver layer actually connects — it is an extra manual step the base image deliberately does not include.
+- [ ] Review `docs/COMPLIANCE.md` and `docs/RESPONSIBLE_AI.md` against your organisation's own requirements.
+- [ ] **If `ENABLE_MEDIA_SEARCH` is on:** confirm the system Tesseract binary is installed (not pip-installable, and not in the base Docker image by default) if on-screen-text search matters to you, and decide whether the configured `MEDIA_LIBRARY_PATH` could contain anything sensitive — there is no per-item classification for media content the way there is for policy documents.
+
 ## Network and Infrastructure
 
 - [ ] The application is served over TLS — HTTP-only deployments are not acceptable for any data beyond a sandboxed/synthetic dataset.
@@ -182,4 +219,8 @@ These items are explicitly out of scope for the current codebase. They are named
 
 <Accordion title="No circuit breaker around Ollama or DB failures">
   Every connection failure is caught and classified (`db/connection.py::ConnectionErrorCategory`), but a sustained Ollama or database outage is not short-circuited at the application layer — every incoming request will attempt and fail until the downstream recovers.
+</Accordion>
+
+<Accordion title="No distributed rate limiting or Kubernetes support">
+  The in-memory rate limiters do not coordinate across multiple replicas — a distributed rate limiter backed by Redis or a similar store is required for any multi-process deployment. There is no Kubernetes support; a single Compose deployment is what is provided. Horizontal scaling of the API layer also does not help with Ollama throughput, since requests are serialised there.
 </Accordion>

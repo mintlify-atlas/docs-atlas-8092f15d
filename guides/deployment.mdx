@@ -1,7 +1,7 @@
 ---
-title: "Deploying Text-to-SQL Agent with Docker Compose"
+title: "Docker Compose Deployment Guide for Text-to-SQL Agent"
 sidebarTitle: "Deployment"
-description: "Run the Text-to-SQL Agent in a container: Docker Compose setup, Ollama and database connectivity, persistent Chroma volume, reverse proxy placement, and known production limitations."
+description: "Run the Text-to-SQL Agent in Docker: Compose setup, Ollama and database connectivity, persistent Chroma volume, and reverse proxy guidance."
 ---
 
 The project ships a multi-stage `Dockerfile` and a `docker-compose.yml` that together produce a single `api` service. A Node.js stage builds the React dashboard into static files; a non-root Python stage serves both the FastAPI REST API and those static files from the same process on port `8000`. There is no separate web-server container, no bundled database, and no bundled Ollama server — both are deliberately external and user-provided, consistent with this project's "connect to your own database" design. Read `SECURITY.md` and `docs/PRODUCTION_CHECKLIST.md` before exposing this service beyond your own machine.

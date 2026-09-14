@@ -23,7 +23,7 @@ When `API_AUTH_TOKEN` is set, a matching `Authorization: Bearer <token>` header 
 ### Query Parameters
 
 <ParamField query="database" type="string">
-  Filter results to a single configured database by its name (`Settings.databases[i].name`). Omit to return tables from all configured databases. Supplying an unknown database name returns an empty `tables` array rather than an error.
+  Filter results to a single configured database by its name (`Settings.databases[i].name`). Omit to return tables from all configured databases. Supplying an unknown database name returns `404 Not Found`.
 </ParamField>
 
 ### Response Fields

@@ -1,7 +1,7 @@
 ---
 title: "LangGraph State Machine: All 11 Agent Nodes Explained"
 sidebarTitle: "Agent Graph"
-description: "A detailed walkthrough of every node in the agent's StateGraph, retry semantics, adaptive budgets, and the AgentState TypedDict that threads through each step."
+description: "Covers every node in the 11-node LangGraph StateGraph: retry routing, adaptive budgets, and the AgentState TypedDict fields each node reads and sets."
 ---
 
 The agent is a compiled LangGraph `StateGraph` with eleven nodes — not a free-form chain or a ReAct loop. Every transition is a named conditional edge in `agent/graph.py::build_graph()`, which means every retry path, every terminal state, and every safety gate is explicitly enumerable from the code itself. State is threaded through all nodes as an `AgentState` TypedDict (`agent/state.py`, `total=False`): each node takes the current state and returns a **partial** dict of updates, which LangGraph merges into the running state. Two fields — `error_history` and `attempt_history` — use an `operator.add` reducer so each node's contribution **appends** rather than overwrites, giving `generate_sql` full visibility into every prior failure on a retry.
